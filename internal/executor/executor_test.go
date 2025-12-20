@@ -161,16 +161,31 @@ func TestExecutorRegisterHandlers(t *testing.T) {
 
 	// Check that handlers are registered
 	expectedHandlers := []string{
+		// Service management
 		"service_restart", "service_start", "service_stop", "service_reload",
 		"service_install", "service_uninstall",
+		// User management
 		"create_user", "delete_user",
+		// SSH keys
 		"ssh_key_add", "ssh_key_remove", "ssh_key_sync",
+		// Firewall
 		"firewall_apply", "firewall_revert",
+		"enable_firewall", "apply_firewall_rule", "revert_firewall_rule",
+		// Web apps
 		"create_webapp", "update_webapp_config", "delete_webapp",
-		"issue_ssl", "renew_ssl",
+		// SSL
+		"ssl_issue", "ssl_renew", "ssl_install",
+		// Databases
 		"create_database", "delete_database",
+		"create_database_user", "delete_database_user",
+		"export_database", "import_database", "optimize_database",
+		// Environment
+		"update_env_file",
+		// Crontab
 		"sync_crontab",
+		// Deployment
 		"deploy", "rollback_deployment", "cleanup_releases",
+		// Generic
 		"run_script",
 	}
 

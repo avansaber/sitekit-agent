@@ -125,8 +125,9 @@ func (e *Executor) RegisterHandlers() {
 	e.Register("delete_webapp", e.handleDeleteWebApp)
 
 	// SSL Certificates
-	e.Register("issue_ssl", e.handleIssueSSL)
-	e.Register("renew_ssl", e.handleRenewSSL)
+	e.Register("ssl_issue", e.handleIssueSSL)
+	e.Register("ssl_renew", e.handleRenewSSL)
+	e.Register("ssl_install", e.handleInstallSSL)
 
 	// Databases
 	e.Register("create_database", e.handleCreateDatabase)

@@ -680,6 +680,60 @@ func (e *Executor) handleRenewSSL(ctx context.Context, payload json.RawMessage) 
 	}
 }
 
+// Install custom SSL certificate (not Let's Encrypt)
+func (e *Executor) handleInstallSSL(ctx context.Context, payload json.RawMessage) comm.JobResult {
+	var p struct {
+		CertificateID string `json:"certificate_id"`
+		Domain        string `json:"domain"`
+		Certificate   string `json:"certificate"`
+		PrivateKey    string `json:"private_key"`
+		Chain         string `json:"chain"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+
+	// Create SSL directory
+	sslDir := fmt.Sprintf("/etc/ssl/hostman/%s", p.Domain)
+	if err := os.MkdirAll(sslDir, 0700); err != nil {
+		return comm.JobResult{Success: false, Error: "Failed to create SSL directory: " + err.Error()}
+	}
+
+	var output strings.Builder
+
+	// Write certificate
+	certPath := filepath.Join(sslDir, "fullchain.pem")
+	certContent := p.Certificate
+	if p.Chain != "" {
+		certContent = p.Certificate + "\n" + p.Chain
+	}
+	if err := os.WriteFile(certPath, []byte(certContent), 0644); err != nil {
+		return comm.JobResult{Success: false, Error: "Failed to write certificate: " + err.Error()}
+	}
+	output.WriteString(fmt.Sprintf("Certificate written to %s\n", certPath))
+
+	// Write private key
+	keyPath := filepath.Join(sslDir, "privkey.pem")
+	if err := os.WriteFile(keyPath, []byte(p.PrivateKey), 0600); err != nil {
+		return comm.JobResult{Success: false, Error: "Failed to write private key: " + err.Error()}
+	}
+	output.WriteString(fmt.Sprintf("Private key written to %s\n", keyPath))
+
+	// Reload nginx to pick up new certificate
+	reloadOut, _, _ := e.RunCommandWithExitCode(ctx, "systemctl", "reload", "nginx")
+	output.WriteString(reloadOut)
+	output.WriteString("Nginx reloaded\n")
+
+	return comm.JobResult{
+		Success: true,
+		Output:  output.String(),
+		Data: map[string]interface{}{
+			"cert_path": certPath,
+			"key_path":  keyPath,
+		},
+	}
+}
+
 // Database handlers
 
 func (e *Executor) handleCreateDatabase(ctx context.Context, payload json.RawMessage) comm.JobResult {
