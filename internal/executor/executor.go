@@ -115,6 +115,9 @@ func (e *Executor) RegisterHandlers() {
 	// Firewall
 	e.Register("firewall_apply", e.handleFirewallApply)
 	e.Register("firewall_revert", e.handleFirewallRevert)
+	e.Register("enable_firewall", e.handleEnableFirewall)
+	e.Register("apply_firewall_rule", e.handleApplyFirewallRule)
+	e.Register("revert_firewall_rule", e.handleRevertFirewallRule)
 
 	// Web Applications
 	e.Register("create_webapp", e.handleCreateWebApp)
@@ -128,6 +131,14 @@ func (e *Executor) RegisterHandlers() {
 	// Databases
 	e.Register("create_database", e.handleCreateDatabase)
 	e.Register("delete_database", e.handleDeleteDatabase)
+	e.Register("create_database_user", e.handleCreateDatabaseUser)
+	e.Register("delete_database_user", e.handleDeleteDatabaseUser)
+	e.Register("export_database", e.handleExportDatabase)
+	e.Register("import_database", e.handleImportDatabase)
+	e.Register("optimize_database", e.handleOptimizeDatabase)
+
+	// Environment
+	e.Register("update_env_file", e.handleUpdateEnvFile)
 
 	// Crontab
 	e.Register("sync_crontab", e.handleSyncCrontab)

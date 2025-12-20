@@ -1175,3 +1175,327 @@ func errToString(err error) string {
 	}
 	return err.Error()
 }
+
+// Database user handlers
+
+func (e *Executor) handleCreateDatabaseUser(ctx context.Context, payload json.RawMessage) comm.JobResult {
+	var p struct {
+		DBName    string `json:"db_name"`
+		Type      string `json:"type"`
+		Username  string `json:"username"`
+		Password  string `json:"password"`
+		CanRemote bool   `json:"can_remote"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+
+	var cmd string
+	host := "localhost"
+	if p.CanRemote {
+		host = "%"
+	}
+
+	switch p.Type {
+	case "mysql", "mariadb":
+		cmd = fmt.Sprintf(
+			"mysql -e \"CREATE USER IF NOT EXISTS '%s'@'%s' IDENTIFIED BY '%s'; GRANT ALL PRIVILEGES ON %s.* TO '%s'@'%s'; FLUSH PRIVILEGES;\"",
+			p.Username, host, p.Password, p.DBName, p.Username, host,
+		)
+	case "postgresql":
+		cmd = fmt.Sprintf(
+			"sudo -u postgres psql -c \"CREATE USER %s WITH PASSWORD '%s'; GRANT ALL PRIVILEGES ON DATABASE %s TO %s;\"",
+			p.Username, p.Password, p.DBName, p.Username,
+		)
+	default:
+		return comm.JobResult{Success: false, Error: fmt.Sprintf("unsupported database type: %s", p.Type)}
+	}
+
+	output, exitCode, err := e.RunCommandWithExitCode(ctx, "bash", "-c", cmd)
+
+	log.Info().Str("username", p.Username).Str("database", p.DBName).Msg("Created database user")
+
+	return comm.JobResult{
+		Success:  err == nil,
+		Output:   output,
+		Error:    errToString(err),
+		ExitCode: exitCode,
+	}
+}
+
+func (e *Executor) handleDeleteDatabaseUser(ctx context.Context, payload json.RawMessage) comm.JobResult {
+	var p struct {
+		Type     string `json:"type"`
+		Username string `json:"username"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+
+	var cmd string
+	switch p.Type {
+	case "mysql", "mariadb":
+		cmd = fmt.Sprintf("mysql -e \"DROP USER IF EXISTS '%s'@'localhost'; DROP USER IF EXISTS '%s'@'%%'; FLUSH PRIVILEGES;\"", p.Username, p.Username)
+	case "postgresql":
+		cmd = fmt.Sprintf("sudo -u postgres psql -c \"DROP USER IF EXISTS %s;\"", p.Username)
+	default:
+		return comm.JobResult{Success: false, Error: fmt.Sprintf("unsupported database type: %s", p.Type)}
+	}
+
+	output, exitCode, err := e.RunCommandWithExitCode(ctx, "bash", "-c", cmd)
+
+	return comm.JobResult{
+		Success:  err == nil,
+		Output:   output,
+		Error:    errToString(err),
+		ExitCode: exitCode,
+	}
+}
+
+func (e *Executor) handleExportDatabase(ctx context.Context, payload json.RawMessage) comm.JobResult {
+	var p struct {
+		DBName           string `json:"db_name"`
+		Type             string `json:"type"`
+		IncludeStructure bool   `json:"include_structure"`
+		IncludeData      bool   `json:"include_data"`
+		Compress         bool   `json:"compress"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+
+	timestamp := strings.ReplaceAll(strings.ReplaceAll(strings.Split(fmt.Sprintf("%v", ctx.Value("timestamp")), ".")[0], "-", ""), " ", "_")
+	if timestamp == "" {
+		timestamp = "export"
+	}
+	outputFile := fmt.Sprintf("/tmp/%s_%s.sql", p.DBName, timestamp)
+
+	var cmd string
+	switch p.Type {
+	case "mysql", "mariadb":
+		args := []string{}
+		if !p.IncludeData {
+			args = append(args, "--no-data")
+		}
+		if !p.IncludeStructure {
+			args = append(args, "--no-create-info")
+		}
+		cmd = fmt.Sprintf("mysqldump %s %s > %s", strings.Join(args, " "), p.DBName, outputFile)
+	case "postgresql":
+		args := []string{}
+		if !p.IncludeData {
+			args = append(args, "--schema-only")
+		}
+		if !p.IncludeStructure {
+			args = append(args, "--data-only")
+		}
+		cmd = fmt.Sprintf("sudo -u postgres pg_dump %s %s > %s", strings.Join(args, " "), p.DBName, outputFile)
+	default:
+		return comm.JobResult{Success: false, Error: fmt.Sprintf("unsupported database type: %s", p.Type)}
+	}
+
+	output, exitCode, err := e.RunCommandWithExitCode(ctx, "bash", "-c", cmd)
+	if err != nil {
+		return comm.JobResult{Success: false, Output: output, Error: errToString(err), ExitCode: exitCode}
+	}
+
+	if p.Compress {
+		_, _, gzErr := e.RunCommandWithExitCode(ctx, "gzip", "-f", outputFile)
+		if gzErr == nil {
+			outputFile = outputFile + ".gz"
+		}
+	}
+
+	return comm.JobResult{
+		Success:  true,
+		Output:   output,
+		ExitCode: exitCode,
+		Data:     map[string]interface{}{"file": outputFile},
+	}
+}
+
+func (e *Executor) handleImportDatabase(ctx context.Context, payload json.RawMessage) comm.JobResult {
+	var p struct {
+		DBName       string `json:"db_name"`
+		Type         string `json:"type"`
+		FilePath     string `json:"file_path"`
+		DropExisting bool   `json:"drop_existing"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+
+	// Check if file is gzipped
+	importFile := p.FilePath
+	if strings.HasSuffix(p.FilePath, ".gz") {
+		unzippedFile := strings.TrimSuffix(p.FilePath, ".gz")
+		_, _, err := e.RunCommandWithExitCode(ctx, "gunzip", "-k", "-f", p.FilePath)
+		if err != nil {
+			return comm.JobResult{Success: false, Error: "failed to decompress file"}
+		}
+		importFile = unzippedFile
+	}
+
+	var cmd string
+	switch p.Type {
+	case "mysql", "mariadb":
+		if p.DropExisting {
+			dropCmd := fmt.Sprintf("mysql -e \"DROP DATABASE IF EXISTS %s; CREATE DATABASE %s;\"", p.DBName, p.DBName)
+			e.RunCommandWithExitCode(ctx, "bash", "-c", dropCmd)
+		}
+		cmd = fmt.Sprintf("mysql %s < %s", p.DBName, importFile)
+	case "postgresql":
+		if p.DropExisting {
+			dropCmd := fmt.Sprintf("sudo -u postgres psql -c \"DROP DATABASE IF EXISTS %s; CREATE DATABASE %s;\"", p.DBName, p.DBName)
+			e.RunCommandWithExitCode(ctx, "bash", "-c", dropCmd)
+		}
+		cmd = fmt.Sprintf("sudo -u postgres psql %s < %s", p.DBName, importFile)
+	default:
+		return comm.JobResult{Success: false, Error: fmt.Sprintf("unsupported database type: %s", p.Type)}
+	}
+
+	output, exitCode, err := e.RunCommandWithExitCode(ctx, "bash", "-c", cmd)
+
+	return comm.JobResult{
+		Success:  err == nil,
+		Output:   output,
+		Error:    errToString(err),
+		ExitCode: exitCode,
+	}
+}
+
+func (e *Executor) handleOptimizeDatabase(ctx context.Context, payload json.RawMessage) comm.JobResult {
+	var p struct {
+		DBName string `json:"db_name"`
+		Type   string `json:"type"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+
+	var cmd string
+	switch p.Type {
+	case "mysql", "mariadb":
+		cmd = fmt.Sprintf("mysqlcheck --optimize %s", p.DBName)
+	case "postgresql":
+		cmd = fmt.Sprintf("sudo -u postgres psql -d %s -c \"VACUUM ANALYZE;\"", p.DBName)
+	default:
+		return comm.JobResult{Success: false, Error: fmt.Sprintf("unsupported database type: %s", p.Type)}
+	}
+
+	output, exitCode, err := e.RunCommandWithExitCode(ctx, "bash", "-c", cmd)
+
+	return comm.JobResult{
+		Success:  err == nil,
+		Output:   output,
+		Error:    errToString(err),
+		ExitCode: exitCode,
+	}
+}
+
+// Firewall handlers
+
+func (e *Executor) handleEnableFirewall(ctx context.Context, payload json.RawMessage) comm.JobResult {
+	var p struct {
+		DefaultIncoming string `json:"default_incoming"`
+		DefaultOutgoing string `json:"default_outgoing"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+
+	// Set defaults
+	if p.DefaultIncoming != "" {
+		e.RunCommandWithExitCode(ctx, "ufw", "default", p.DefaultIncoming, "incoming")
+	}
+	if p.DefaultOutgoing != "" {
+		e.RunCommandWithExitCode(ctx, "ufw", "default", p.DefaultOutgoing, "outgoing")
+	}
+
+	// Enable UFW (non-interactive)
+	output, exitCode, err := e.RunCommandWithExitCode(ctx, "bash", "-c", "echo 'y' | ufw enable")
+
+	log.Info().Msg("Firewall enabled")
+
+	return comm.JobResult{
+		Success:  err == nil,
+		Output:   output,
+		Error:    errToString(err),
+		ExitCode: exitCode,
+	}
+}
+
+func (e *Executor) handleApplyFirewallRule(ctx context.Context, payload json.RawMessage) comm.JobResult {
+	var p struct {
+		RuleID  string `json:"rule_id"`
+		Command string `json:"command"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+
+	output, exitCode, err := e.RunCommandWithExitCode(ctx, "bash", "-c", p.Command)
+
+	log.Info().Str("rule_id", p.RuleID).Str("command", p.Command).Msg("Applied firewall rule")
+
+	return comm.JobResult{
+		Success:  err == nil,
+		Output:   output,
+		Error:    errToString(err),
+		ExitCode: exitCode,
+	}
+}
+
+func (e *Executor) handleRevertFirewallRule(ctx context.Context, payload json.RawMessage) comm.JobResult {
+	var p struct {
+		RuleID  string `json:"rule_id"`
+		Command string `json:"command"`
+		Reason  string `json:"reason"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+
+	output, exitCode, err := e.RunCommandWithExitCode(ctx, "bash", "-c", p.Command)
+
+	log.Info().Str("rule_id", p.RuleID).Str("reason", p.Reason).Msg("Reverted firewall rule")
+
+	return comm.JobResult{
+		Success:  err == nil,
+		Output:   output,
+		Error:    errToString(err),
+		ExitCode: exitCode,
+	}
+}
+
+// Environment file handler
+
+func (e *Executor) handleUpdateEnvFile(ctx context.Context, payload json.RawMessage) comm.JobResult {
+	var p struct {
+		AppPath string `json:"app_path"`
+		Content string `json:"content"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+
+	envPath := filepath.Join(p.AppPath, ".env")
+
+	// Backup existing .env
+	if _, err := os.Stat(envPath); err == nil {
+		backupPath := envPath + ".backup"
+		e.RunCommandWithExitCode(ctx, "cp", envPath, backupPath)
+	}
+
+	// Write new .env
+	if err := os.WriteFile(envPath, []byte(p.Content), 0644); err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+
+	log.Info().Str("path", envPath).Msg("Updated environment file")
+
+	return comm.JobResult{
+		Success: true,
+		Output:  fmt.Sprintf("Updated %s", envPath),
+	}
+}
