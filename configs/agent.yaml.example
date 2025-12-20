@@ -1,0 +1,23 @@
+# Hostman Agent Configuration
+# Copy this file to /opt/hostman/agent.yaml
+
+# SaaS API URL
+saas_url: https://hostman.example.com
+
+# Agent authentication token (from server creation)
+agent_token: your-agent-token-here
+
+# Server ID (assigned by SaaS)
+server_id: ""
+
+# WebSocket URL for real-time communication (optional)
+websocket_url: wss://ws.hostman.example.com
+
+# Job polling interval (fallback when WebSocket unavailable)
+poll_interval: 5s
+
+# Stats reporting interval
+stats_interval: 60s
+
+# Log level: debug, info, warn, error
+log_level: info
