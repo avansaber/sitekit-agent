@@ -116,8 +116,26 @@ func (e *Executor) RegisterHandlers() {
 	e.Register("firewall_apply", e.handleFirewallApply)
 	e.Register("firewall_revert", e.handleFirewallRevert)
 
+	// Web Applications
+	e.Register("create_webapp", e.handleCreateWebApp)
+	e.Register("update_webapp_config", e.handleUpdateWebAppConfig)
+	e.Register("delete_webapp", e.handleDeleteWebApp)
+
+	// SSL Certificates
+	e.Register("issue_ssl", e.handleIssueSSL)
+	e.Register("renew_ssl", e.handleRenewSSL)
+
+	// Databases
+	e.Register("create_database", e.handleCreateDatabase)
+	e.Register("delete_database", e.handleDeleteDatabase)
+
+	// Crontab
+	e.Register("sync_crontab", e.handleSyncCrontab)
+
 	// Deployment
 	e.Register("deploy", e.handleDeploy)
+	e.Register("rollback_deployment", e.handleRollbackDeployment)
+	e.Register("cleanup_releases", e.handleCleanupReleases)
 
 	// Generic command (use with caution)
 	e.Register("run_script", e.handleRunScript)

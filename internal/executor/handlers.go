@@ -421,6 +421,550 @@ func (e *Executor) handleFirewallRevert(ctx context.Context, payload json.RawMes
 	}
 }
 
+// Web Application handlers
+
+func (e *Executor) handleCreateWebApp(ctx context.Context, payload json.RawMessage) comm.JobResult {
+	var p struct {
+		AppID       string `json:"app_id"`
+		Domain      string `json:"domain"`
+		Username    string `json:"username"`
+		RootPath    string `json:"root_path"`
+		PublicPath  string `json:"public_path"`
+		PhpVersion  string `json:"php_version"`
+		AppType     string `json:"app_type"` // php, static, nodejs
+		NginxConfig string `json:"nginx_config"`
+		FpmConfig   string `json:"fpm_config"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+
+	log.Info().
+		Str("app_id", p.AppID).
+		Str("domain", p.Domain).
+		Msg("Creating web application")
+
+	var output strings.Builder
+
+	// Create directory structure
+	dirs := []string{
+		p.RootPath,
+		filepath.Join(p.RootPath, "releases"),
+		filepath.Join(p.RootPath, "shared"),
+		filepath.Join(p.RootPath, "logs"),
+		filepath.Dir(p.PublicPath),
+	}
+	for _, dir := range dirs {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return comm.JobResult{Success: false, Error: fmt.Sprintf("failed to create %s: %v", dir, err)}
+		}
+	}
+	output.WriteString("Created directory structure\n")
+
+	// Write Nginx config
+	nginxPath := fmt.Sprintf("/etc/nginx/sites-available/%s.conf", p.Domain)
+	if err := os.WriteFile(nginxPath, []byte(p.NginxConfig), 0644); err != nil {
+		return comm.JobResult{Success: false, Error: fmt.Sprintf("failed to write nginx config: %v", err)}
+	}
+
+	// Enable site
+	enabledPath := fmt.Sprintf("/etc/nginx/sites-enabled/%s.conf", p.Domain)
+	os.Remove(enabledPath)
+	if err := os.Symlink(nginxPath, enabledPath); err != nil {
+		return comm.JobResult{Success: false, Error: fmt.Sprintf("failed to enable site: %v", err)}
+	}
+	output.WriteString("Nginx config installed\n")
+
+	// Write PHP-FPM pool config if PHP app
+	if p.AppType == "php" && p.FpmConfig != "" {
+		fpmPath := fmt.Sprintf("/etc/php/%s/fpm/pool.d/%s.conf", p.PhpVersion, p.Username)
+		if err := os.WriteFile(fpmPath, []byte(p.FpmConfig), 0644); err != nil {
+			return comm.JobResult{Success: false, Error: fmt.Sprintf("failed to write fpm config: %v", err)}
+		}
+		output.WriteString("PHP-FPM pool config installed\n")
+
+		// Reload PHP-FPM
+		e.RunCommand(ctx, "systemctl", "reload", fmt.Sprintf("php%s-fpm", p.PhpVersion))
+	}
+
+	// Test and reload Nginx
+	out, _, err := e.RunCommandWithExitCode(ctx, "nginx", "-t")
+	output.WriteString(out + "\n")
+	if err != nil {
+		return comm.JobResult{Success: false, Output: output.String(), Error: "nginx config test failed"}
+	}
+
+	e.RunCommand(ctx, "systemctl", "reload", "nginx")
+	output.WriteString("Nginx reloaded successfully\n")
+
+	// Set ownership
+	e.RunCommand(ctx, "chown", "-R", p.Username+":"+p.Username, p.RootPath)
+
+	return comm.JobResult{Success: true, Output: output.String()}
+}
+
+func (e *Executor) handleUpdateWebAppConfig(ctx context.Context, payload json.RawMessage) comm.JobResult {
+	var p struct {
+		AppID       string `json:"app_id"`
+		Domain      string `json:"domain"`
+		PhpVersion  string `json:"php_version"`
+		NginxConfig string `json:"nginx_config"`
+		FpmConfig   string `json:"fpm_config"`
+		Username    string `json:"username"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+
+	var output strings.Builder
+
+	// Update Nginx config
+	nginxPath := fmt.Sprintf("/etc/nginx/sites-available/%s.conf", p.Domain)
+	if err := os.WriteFile(nginxPath, []byte(p.NginxConfig), 0644); err != nil {
+		return comm.JobResult{Success: false, Error: fmt.Sprintf("failed to write nginx config: %v", err)}
+	}
+	output.WriteString("Nginx config updated\n")
+
+	// Update PHP-FPM config if provided
+	if p.FpmConfig != "" {
+		fpmPath := fmt.Sprintf("/etc/php/%s/fpm/pool.d/%s.conf", p.PhpVersion, p.Username)
+		if err := os.WriteFile(fpmPath, []byte(p.FpmConfig), 0644); err != nil {
+			return comm.JobResult{Success: false, Error: fmt.Sprintf("failed to write fpm config: %v", err)}
+		}
+		e.RunCommand(ctx, "systemctl", "reload", fmt.Sprintf("php%s-fpm", p.PhpVersion))
+		output.WriteString("PHP-FPM config updated and reloaded\n")
+	}
+
+	// Test and reload Nginx
+	out, _, err := e.RunCommandWithExitCode(ctx, "nginx", "-t")
+	output.WriteString(out + "\n")
+	if err != nil {
+		return comm.JobResult{Success: false, Output: output.String(), Error: "nginx config test failed"}
+	}
+
+	e.RunCommand(ctx, "systemctl", "reload", "nginx")
+	output.WriteString("Nginx reloaded successfully\n")
+
+	return comm.JobResult{Success: true, Output: output.String()}
+}
+
+func (e *Executor) handleDeleteWebApp(ctx context.Context, payload json.RawMessage) comm.JobResult {
+	var p struct {
+		AppID       string `json:"app_id"`
+		Domain      string `json:"domain"`
+		Username    string `json:"username"`
+		PhpVersion  string `json:"php_version"`
+		DeleteFiles bool   `json:"delete_files"`
+		RootPath    string `json:"root_path"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+
+	var output strings.Builder
+
+	// Remove Nginx config
+	nginxPath := fmt.Sprintf("/etc/nginx/sites-available/%s.conf", p.Domain)
+	enabledPath := fmt.Sprintf("/etc/nginx/sites-enabled/%s.conf", p.Domain)
+	os.Remove(enabledPath)
+	os.Remove(nginxPath)
+	output.WriteString("Nginx config removed\n")
+
+	// Remove PHP-FPM pool config
+	if p.PhpVersion != "" {
+		fpmPath := fmt.Sprintf("/etc/php/%s/fpm/pool.d/%s.conf", p.PhpVersion, p.Username)
+		os.Remove(fpmPath)
+		e.RunCommand(ctx, "systemctl", "reload", fmt.Sprintf("php%s-fpm", p.PhpVersion))
+		output.WriteString("PHP-FPM pool config removed\n")
+	}
+
+	// Reload Nginx
+	e.RunCommand(ctx, "systemctl", "reload", "nginx")
+	output.WriteString("Nginx reloaded\n")
+
+	// Delete files if requested
+	if p.DeleteFiles && p.RootPath != "" {
+		if err := os.RemoveAll(p.RootPath); err != nil {
+			output.WriteString(fmt.Sprintf("Warning: failed to delete files: %v\n", err))
+		} else {
+			output.WriteString("Application files deleted\n")
+		}
+	}
+
+	return comm.JobResult{Success: true, Output: output.String()}
+}
+
+// SSL Certificate handler
+
+func (e *Executor) handleIssueSSL(ctx context.Context, payload json.RawMessage) comm.JobResult {
+	var p struct {
+		CertID    string   `json:"cert_id"`
+		Domains   []string `json:"domains"`
+		Email     string   `json:"email"`
+		Webroot   string   `json:"webroot"`
+		Staging   bool     `json:"staging"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+
+	log.Info().
+		Strs("domains", p.Domains).
+		Msg("Issuing SSL certificate")
+
+	args := []string{
+		"certonly",
+		"--webroot",
+		"--webroot-path", p.Webroot,
+		"--email", p.Email,
+		"--agree-tos",
+		"--non-interactive",
+	}
+
+	if p.Staging {
+		args = append(args, "--staging")
+	}
+
+	for _, domain := range p.Domains {
+		args = append(args, "-d", domain)
+	}
+
+	output, exitCode, err := e.RunCommandWithExitCode(ctx, "certbot", args...)
+
+	if err != nil {
+		return comm.JobResult{
+			Success:  false,
+			Output:   output,
+			Error:    err.Error(),
+			ExitCode: exitCode,
+		}
+	}
+
+	// Return certificate paths
+	primaryDomain := p.Domains[0]
+	certPath := fmt.Sprintf("/etc/letsencrypt/live/%s/fullchain.pem", primaryDomain)
+	keyPath := fmt.Sprintf("/etc/letsencrypt/live/%s/privkey.pem", primaryDomain)
+
+	return comm.JobResult{
+		Success: true,
+		Output:  output,
+		Data: map[string]interface{}{
+			"certificate_path": certPath,
+			"private_key_path": keyPath,
+		},
+	}
+}
+
+func (e *Executor) handleRenewSSL(ctx context.Context, payload json.RawMessage) comm.JobResult {
+	var p struct {
+		CertID  string `json:"cert_id"`
+		Domain  string `json:"domain"`
+		Force   bool   `json:"force"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+
+	args := []string{"renew", "--cert-name", p.Domain, "--non-interactive"}
+	if p.Force {
+		args = append(args, "--force-renewal")
+	}
+
+	output, exitCode, err := e.RunCommandWithExitCode(ctx, "certbot", args...)
+
+	return comm.JobResult{
+		Success:  err == nil,
+		Output:   output,
+		Error:    errToString(err),
+		ExitCode: exitCode,
+	}
+}
+
+// Database handlers
+
+func (e *Executor) handleCreateDatabase(ctx context.Context, payload json.RawMessage) comm.JobResult {
+	var p struct {
+		DatabaseID   string `json:"database_id"`
+		DatabaseName string `json:"database_name"`
+		DatabaseType string `json:"database_type"` // mysql, mariadb, postgresql
+		Username     string `json:"username"`
+		Password     string `json:"password"`
+		Host         string `json:"host"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+
+	log.Info().
+		Str("database", p.DatabaseName).
+		Str("type", p.DatabaseType).
+		Msg("Creating database")
+
+	var output strings.Builder
+
+	switch p.DatabaseType {
+	case "mysql", "mariadb":
+		// Create database
+		createDB := fmt.Sprintf("CREATE DATABASE IF NOT EXISTS `%s` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;", p.DatabaseName)
+		out, _, err := e.RunCommandWithExitCode(ctx, "mysql", "-e", createDB)
+		output.WriteString(out + "\n")
+		if err != nil {
+			return comm.JobResult{Success: false, Output: output.String(), Error: err.Error()}
+		}
+
+		// Create user and grant privileges
+		if p.Username != "" && p.Password != "" {
+			host := p.Host
+			if host == "" {
+				host = "localhost"
+			}
+			createUser := fmt.Sprintf("CREATE USER IF NOT EXISTS '%s'@'%s' IDENTIFIED BY '%s';", p.Username, host, p.Password)
+			out, _, err = e.RunCommandWithExitCode(ctx, "mysql", "-e", createUser)
+			output.WriteString(out + "\n")
+			if err != nil {
+				return comm.JobResult{Success: false, Output: output.String(), Error: err.Error()}
+			}
+
+			grant := fmt.Sprintf("GRANT ALL PRIVILEGES ON `%s`.* TO '%s'@'%s'; FLUSH PRIVILEGES;", p.DatabaseName, p.Username, host)
+			out, _, err = e.RunCommandWithExitCode(ctx, "mysql", "-e", grant)
+			output.WriteString(out + "\n")
+			if err != nil {
+				return comm.JobResult{Success: false, Output: output.String(), Error: err.Error()}
+			}
+		}
+
+	case "postgresql":
+		// Create database
+		out, _, _ := e.RunCommandWithExitCode(ctx, "sudo", "-u", "postgres", "psql", "-c",
+			fmt.Sprintf("CREATE DATABASE \"%s\";", p.DatabaseName))
+		output.WriteString(out + "\n")
+
+		// Create user and grant privileges
+		if p.Username != "" && p.Password != "" {
+			out, _, _ = e.RunCommandWithExitCode(ctx, "sudo", "-u", "postgres", "psql", "-c",
+				fmt.Sprintf("CREATE USER \"%s\" WITH PASSWORD '%s';", p.Username, p.Password))
+			output.WriteString(out + "\n")
+
+			out, _, _ = e.RunCommandWithExitCode(ctx, "sudo", "-u", "postgres", "psql", "-c",
+				fmt.Sprintf("GRANT ALL PRIVILEGES ON DATABASE \"%s\" TO \"%s\";", p.DatabaseName, p.Username))
+			output.WriteString(out + "\n")
+		}
+
+	default:
+		return comm.JobResult{Success: false, Error: fmt.Sprintf("unsupported database type: %s", p.DatabaseType)}
+	}
+
+	output.WriteString("Database created successfully\n")
+	return comm.JobResult{Success: true, Output: output.String()}
+}
+
+func (e *Executor) handleDeleteDatabase(ctx context.Context, payload json.RawMessage) comm.JobResult {
+	var p struct {
+		DatabaseID   string `json:"database_id"`
+		DatabaseName string `json:"database_name"`
+		DatabaseType string `json:"database_type"`
+		Username     string `json:"username"`
+		Host         string `json:"host"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+
+	var output strings.Builder
+
+	switch p.DatabaseType {
+	case "mysql", "mariadb":
+		// Drop user if exists
+		if p.Username != "" {
+			host := p.Host
+			if host == "" {
+				host = "localhost"
+			}
+			dropUser := fmt.Sprintf("DROP USER IF EXISTS '%s'@'%s';", p.Username, host)
+			out, _, _ := e.RunCommandWithExitCode(ctx, "mysql", "-e", dropUser)
+			output.WriteString(out + "\n")
+		}
+
+		// Drop database
+		dropDB := fmt.Sprintf("DROP DATABASE IF EXISTS `%s`;", p.DatabaseName)
+		out, _, err := e.RunCommandWithExitCode(ctx, "mysql", "-e", dropDB)
+		output.WriteString(out + "\n")
+		if err != nil {
+			return comm.JobResult{Success: false, Output: output.String(), Error: err.Error()}
+		}
+
+	case "postgresql":
+		// Drop user if exists
+		if p.Username != "" {
+			out, _, _ := e.RunCommandWithExitCode(ctx, "sudo", "-u", "postgres", "psql", "-c",
+				fmt.Sprintf("DROP USER IF EXISTS \"%s\";", p.Username))
+			output.WriteString(out + "\n")
+		}
+
+		// Drop database
+		out, _, _ := e.RunCommandWithExitCode(ctx, "sudo", "-u", "postgres", "psql", "-c",
+			fmt.Sprintf("DROP DATABASE IF EXISTS \"%s\";", p.DatabaseName))
+		output.WriteString(out + "\n")
+
+	default:
+		return comm.JobResult{Success: false, Error: fmt.Sprintf("unsupported database type: %s", p.DatabaseType)}
+	}
+
+	output.WriteString("Database deleted successfully\n")
+	return comm.JobResult{Success: true, Output: output.String()}
+}
+
+// Crontab handler
+
+func (e *Executor) handleSyncCrontab(ctx context.Context, payload json.RawMessage) comm.JobResult {
+	var p struct {
+		Username string `json:"username"`
+		Entries  []struct {
+			Schedule string `json:"schedule"`
+			Command  string `json:"command"`
+			Enabled  bool   `json:"enabled"`
+		} `json:"entries"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+
+	var crontab strings.Builder
+	crontab.WriteString("# Managed by Hostman - Do not edit directly\n")
+	crontab.WriteString("SHELL=/bin/bash\n")
+	crontab.WriteString("PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin\n\n")
+
+	for _, entry := range p.Entries {
+		if !entry.Enabled {
+			crontab.WriteString("# ")
+		}
+		crontab.WriteString(fmt.Sprintf("%s %s\n", entry.Schedule, entry.Command))
+	}
+
+	// Write to temp file
+	tmpFile, err := os.CreateTemp("", "crontab-*")
+	if err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+	defer os.Remove(tmpFile.Name())
+
+	if _, err := tmpFile.WriteString(crontab.String()); err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+	tmpFile.Close()
+
+	// Install crontab for user
+	output, exitCode, err := e.RunCommandWithExitCode(ctx, "crontab", "-u", p.Username, tmpFile.Name())
+
+	return comm.JobResult{
+		Success:  err == nil,
+		Output:   output,
+		Error:    errToString(err),
+		ExitCode: exitCode,
+	}
+}
+
+// Rollback handler
+
+func (e *Executor) handleRollbackDeployment(ctx context.Context, payload json.RawMessage) comm.JobResult {
+	var p struct {
+		AppID       string `json:"app_id"`
+		RootPath    string `json:"root_path"`
+		CommitHash  string `json:"commit_hash"` // Release to rollback to
+		Username    string `json:"username"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+
+	releaseDir := filepath.Join(p.RootPath, "releases", p.CommitHash)
+
+	// Check if release exists
+	if _, err := os.Stat(releaseDir); os.IsNotExist(err) {
+		return comm.JobResult{Success: false, Error: fmt.Sprintf("release %s not found", p.CommitHash)}
+	}
+
+	// Update symlink
+	currentLink := filepath.Join(p.RootPath, "current")
+	os.Remove(currentLink)
+	if err := os.Symlink(releaseDir, currentLink); err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+
+	return comm.JobResult{
+		Success: true,
+		Output:  fmt.Sprintf("Rolled back to release %s", p.CommitHash),
+	}
+}
+
+// Cleanup old releases
+func (e *Executor) handleCleanupReleases(ctx context.Context, payload json.RawMessage) comm.JobResult {
+	var p struct {
+		AppID    string `json:"app_id"`
+		RootPath string `json:"root_path"`
+		Keep     int    `json:"keep"` // Number of releases to keep
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+
+	if p.Keep < 1 {
+		p.Keep = 5
+	}
+
+	releasesDir := filepath.Join(p.RootPath, "releases")
+	entries, err := os.ReadDir(releasesDir)
+	if err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+
+	// Get current release (symlink target)
+	currentLink := filepath.Join(p.RootPath, "current")
+	currentTarget, _ := os.Readlink(currentLink)
+	currentRelease := filepath.Base(currentTarget)
+
+	// Sort by modification time (oldest first)
+	type releaseInfo struct {
+		name    string
+		modTime int64
+	}
+	var releases []releaseInfo
+	for _, entry := range entries {
+		if entry.IsDir() && entry.Name() != currentRelease {
+			info, _ := entry.Info()
+			releases = append(releases, releaseInfo{entry.Name(), info.ModTime().Unix()})
+		}
+	}
+
+	// Remove oldest releases beyond keep limit
+	if len(releases) > p.Keep-1 {
+		// Sort by modTime ascending
+		for i := 0; i < len(releases)-1; i++ {
+			for j := i + 1; j < len(releases); j++ {
+				if releases[i].modTime > releases[j].modTime {
+					releases[i], releases[j] = releases[j], releases[i]
+				}
+			}
+		}
+
+		toRemove := len(releases) - (p.Keep - 1)
+		var removed []string
+		for i := 0; i < toRemove; i++ {
+			path := filepath.Join(releasesDir, releases[i].name)
+			if err := os.RemoveAll(path); err == nil {
+				removed = append(removed, releases[i].name)
+			}
+		}
+
+		return comm.JobResult{
+			Success: true,
+			Output:  fmt.Sprintf("Removed %d old releases: %v", len(removed), removed),
+		}
+	}
+
+	return comm.JobResult{Success: true, Output: "No releases to clean up"}
+}
+
 // Deployment handler
 
 func (e *Executor) handleDeploy(ctx context.Context, payload json.RawMessage) comm.JobResult {

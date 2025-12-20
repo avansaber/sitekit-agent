@@ -27,10 +27,11 @@ type Job struct {
 }
 
 type JobResult struct {
-	Success  bool   `json:"success"`
-	Output   string `json:"output,omitempty"`
-	Error    string `json:"error,omitempty"`
-	ExitCode int    `json:"exit_code,omitempty"`
+	Success  bool                   `json:"success"`
+	Output   string                 `json:"output,omitempty"`
+	Error    string                 `json:"error,omitempty"`
+	ExitCode int                    `json:"exit_code,omitempty"`
+	Data     map[string]interface{} `json:"data,omitempty"`
 }
 
 type JobsResponse struct {
@@ -101,6 +102,7 @@ func (c *Client) ReportJobComplete(ctx context.Context, jobID string, result Job
 		"output":    result.Output,
 		"error":     result.Error,
 		"exit_code": result.ExitCode,
+		"data":      result.Data,
 	}
 
 	resp, err := c.doRequest(ctx, http.MethodPost, "/api/agent/jobs/"+jobID+"/complete", payload)
