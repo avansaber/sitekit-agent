@@ -868,40 +868,51 @@ func (e *Executor) handleSyncCrontab(ctx context.Context, payload json.RawMessag
 
 func (e *Executor) handleRollbackDeployment(ctx context.Context, payload json.RawMessage) comm.JobResult {
 	var p struct {
-		AppID       string `json:"app_id"`
-		RootPath    string `json:"root_path"`
-		CommitHash  string `json:"commit_hash"` // Release to rollback to
-		Username    string `json:"username"`
+		WebAppID   string `json:"web_app_id"`
+		AppPath    string `json:"app_path"`
+		CommitHash string `json:"commit_hash"` // Release to rollback to
 	}
 	if err := json.Unmarshal(payload, &p); err != nil {
 		return comm.JobResult{Success: false, Error: err.Error()}
 	}
 
-	releaseDir := filepath.Join(p.RootPath, "releases", p.CommitHash)
+	// Handle short commit hash (12 chars)
+	releaseHash := p.CommitHash
+	if len(releaseHash) > 12 {
+		releaseHash = releaseHash[:12]
+	}
+	releaseDir := filepath.Join(p.AppPath, "releases", releaseHash)
 
 	// Check if release exists
 	if _, err := os.Stat(releaseDir); os.IsNotExist(err) {
-		return comm.JobResult{Success: false, Error: fmt.Sprintf("release %s not found", p.CommitHash)}
+		return comm.JobResult{Success: false, Error: fmt.Sprintf("release %s not found", releaseHash)}
 	}
 
-	// Update symlink
-	currentLink := filepath.Join(p.RootPath, "current")
-	os.Remove(currentLink)
-	if err := os.Symlink(releaseDir, currentLink); err != nil {
+	// Atomic symlink swap
+	currentLink := filepath.Join(p.AppPath, "current")
+	tempLink := filepath.Join(p.AppPath, ".current.tmp")
+
+	os.Remove(tempLink)
+	if err := os.Symlink(releaseDir, tempLink); err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+
+	if err := os.Rename(tempLink, currentLink); err != nil {
+		os.Remove(tempLink)
 		return comm.JobResult{Success: false, Error: err.Error()}
 	}
 
 	return comm.JobResult{
 		Success: true,
-		Output:  fmt.Sprintf("Rolled back to release %s", p.CommitHash),
+		Output:  fmt.Sprintf("Rolled back to release %s", releaseHash),
 	}
 }
 
 // Cleanup old releases
 func (e *Executor) handleCleanupReleases(ctx context.Context, payload json.RawMessage) comm.JobResult {
 	var p struct {
-		AppID    string `json:"app_id"`
-		RootPath string `json:"root_path"`
+		WebAppID string `json:"web_app_id"`
+		AppPath  string `json:"app_path"`
 		Keep     int    `json:"keep"` // Number of releases to keep
 	}
 	if err := json.Unmarshal(payload, &p); err != nil {
@@ -912,14 +923,14 @@ func (e *Executor) handleCleanupReleases(ctx context.Context, payload json.RawMe
 		p.Keep = 5
 	}
 
-	releasesDir := filepath.Join(p.RootPath, "releases")
+	releasesDir := filepath.Join(p.AppPath, "releases")
 	entries, err := os.ReadDir(releasesDir)
 	if err != nil {
 		return comm.JobResult{Success: false, Error: err.Error()}
 	}
 
 	// Get current release (symlink target)
-	currentLink := filepath.Join(p.RootPath, "current")
+	currentLink := filepath.Join(p.AppPath, "current")
 	currentTarget, _ := os.Readlink(currentLink)
 	currentRelease := filepath.Base(currentTarget)
 
@@ -969,64 +980,153 @@ func (e *Executor) handleCleanupReleases(ctx context.Context, payload json.RawMe
 
 func (e *Executor) handleDeploy(ctx context.Context, payload json.RawMessage) comm.JobResult {
 	var p struct {
-		AppID        string `json:"app_id"`
-		Repository   string `json:"repository"`
-		Branch       string `json:"branch"`
-		CommitHash   string `json:"commit_hash"`
-		DeployScript string `json:"deploy_script"`
-		RootPath     string `json:"root_path"`
-		Username     string `json:"username"`
+		DeploymentID      string   `json:"deployment_id"`
+		AppPath           string   `json:"app_path"`
+		Repository        string   `json:"repository"`
+		Branch            string   `json:"branch"`
+		CommitHash        string   `json:"commit_hash"`
+		SSHUrl            string   `json:"ssh_url"`
+		DeployKey         string   `json:"deploy_key"`
+		SharedFiles       []string `json:"shared_files"`
+		SharedDirectories []string `json:"shared_directories"`
+		BuildScript       string   `json:"build_script"`
+		PHPVersion        string   `json:"php_version"`
 	}
 	if err := json.Unmarshal(payload, &p); err != nil {
 		return comm.JobResult{Success: false, Error: err.Error()}
 	}
 
 	log.Info().
-		Str("app_id", p.AppID).
+		Str("deployment_id", p.DeploymentID).
 		Str("branch", p.Branch).
 		Str("commit", p.CommitHash).
 		Msg("Starting deployment")
 
 	var output strings.Builder
 
-	// Create releases directory
-	releasesDir := filepath.Join(p.RootPath, "releases")
-	releaseDir := filepath.Join(releasesDir, p.CommitHash)
+	// Setup directories
+	releasesDir := filepath.Join(p.AppPath, "releases")
+	sharedDir := filepath.Join(p.AppPath, "shared")
+	releaseDir := filepath.Join(releasesDir, p.CommitHash[:12])
 	os.MkdirAll(releaseDir, 0755)
+	os.MkdirAll(sharedDir, 0755)
 
-	// Clone repository
-	out, _, err := e.RunCommandWithExitCode(ctx, "git", "clone", "--depth=1", "--branch="+p.Branch, p.Repository, releaseDir)
-	output.WriteString(out + "\n")
-	if err != nil {
-		return comm.JobResult{Success: false, Output: output.String(), Error: err.Error()}
+	// Setup deploy key for SSH authentication
+	if p.DeployKey != "" {
+		keyPath := filepath.Join(os.TempDir(), fmt.Sprintf("hostman-deploy-%s", p.DeploymentID))
+		if err := os.WriteFile(keyPath, []byte(p.DeployKey), 0600); err != nil {
+			return comm.JobResult{Success: false, Output: output.String(), Error: "Failed to write deploy key: " + err.Error()}
+		}
+		defer os.Remove(keyPath)
+
+		// Set GIT_SSH_COMMAND for this deployment
+		os.Setenv("GIT_SSH_COMMAND", fmt.Sprintf("ssh -i %s -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null", keyPath))
+		defer os.Unsetenv("GIT_SSH_COMMAND")
 	}
 
-	// Run deploy script if provided
-	if p.DeployScript != "" {
+	// Clone repository using SSH URL
+	cloneUrl := p.SSHUrl
+	if cloneUrl == "" {
+		cloneUrl = p.Repository
+	}
+	output.WriteString(fmt.Sprintf("Cloning %s (branch: %s)...\n", p.Repository, p.Branch))
+	out, _, err := e.RunCommandWithExitCode(ctx, "git", "clone", "--depth=1", "--branch="+p.Branch, cloneUrl, releaseDir)
+	output.WriteString(out + "\n")
+	if err != nil {
+		return comm.JobResult{Success: false, Output: output.String(), Error: "Clone failed: " + err.Error()}
+	}
+
+	// Setup shared directories (create in shared and symlink to release)
+	for _, dir := range p.SharedDirectories {
+		sharedPath := filepath.Join(sharedDir, dir)
+		releasePath := filepath.Join(releaseDir, dir)
+
+		// Create shared directory if it doesn't exist
+		os.MkdirAll(sharedPath, 0755)
+
+		// Remove release path if exists (could be from clone)
+		os.RemoveAll(releasePath)
+
+		// Create parent directory for symlink
+		os.MkdirAll(filepath.Dir(releasePath), 0755)
+
+		// Create symlink
+		if err := os.Symlink(sharedPath, releasePath); err != nil {
+			log.Warn().Err(err).Str("dir", dir).Msg("Failed to symlink shared directory")
+		} else {
+			output.WriteString(fmt.Sprintf("Linked shared directory: %s\n", dir))
+		}
+	}
+
+	// Setup shared files (copy from release to shared on first deploy, then symlink)
+	for _, file := range p.SharedFiles {
+		sharedPath := filepath.Join(sharedDir, file)
+		releasePath := filepath.Join(releaseDir, file)
+
+		// If shared file doesn't exist but release has it, copy it
+		if _, err := os.Stat(sharedPath); os.IsNotExist(err) {
+			if _, err := os.Stat(releasePath); err == nil {
+				os.MkdirAll(filepath.Dir(sharedPath), 0755)
+				e.RunCommand(ctx, "cp", releasePath, sharedPath)
+			}
+		}
+
+		// Remove release file and create symlink
+		os.Remove(releasePath)
+		os.MkdirAll(filepath.Dir(releasePath), 0755)
+		if err := os.Symlink(sharedPath, releasePath); err != nil {
+			log.Warn().Err(err).Str("file", file).Msg("Failed to symlink shared file")
+		} else {
+			output.WriteString(fmt.Sprintf("Linked shared file: %s\n", file))
+		}
+	}
+
+	// Run build script if provided
+	if p.BuildScript != "" {
+		output.WriteString("Running build script...\n")
 		scriptPath := filepath.Join(releaseDir, ".hostman-deploy.sh")
-		if err := os.WriteFile(scriptPath, []byte(p.DeployScript), 0755); err != nil {
-			return comm.JobResult{Success: false, Output: output.String(), Error: err.Error()}
+		scriptContent := "#!/bin/bash\nset -e\ncd " + releaseDir + "\n"
+		if p.PHPVersion != "" {
+			scriptContent += fmt.Sprintf("export PATH=/usr/bin/php%s:$PATH\n", p.PHPVersion)
+		}
+		scriptContent += p.BuildScript
+
+		if err := os.WriteFile(scriptPath, []byte(scriptContent), 0755); err != nil {
+			return comm.JobResult{Success: false, Output: output.String(), Error: "Failed to write build script: " + err.Error()}
 		}
 
 		out, _, err = e.RunCommandWithExitCode(ctx, "bash", scriptPath)
 		output.WriteString(out + "\n")
+		os.Remove(scriptPath)
 		if err != nil {
-			return comm.JobResult{Success: false, Output: output.String(), Error: err.Error()}
+			return comm.JobResult{Success: false, Output: output.String(), Error: "Build script failed: " + err.Error()}
 		}
 	}
 
-	// Update symlink
-	currentLink := filepath.Join(p.RootPath, "current")
-	os.Remove(currentLink)
-	if err := os.Symlink(releaseDir, currentLink); err != nil {
-		return comm.JobResult{Success: false, Output: output.String(), Error: err.Error()}
+	// Atomic symlink swap
+	currentLink := filepath.Join(p.AppPath, "current")
+	tempLink := filepath.Join(p.AppPath, ".current.tmp")
+
+	// Create temp symlink
+	os.Remove(tempLink)
+	if err := os.Symlink(releaseDir, tempLink); err != nil {
+		return comm.JobResult{Success: false, Output: output.String(), Error: "Failed to create symlink: " + err.Error()}
 	}
 
-	// Set ownership
-	e.RunCommand(ctx, "chown", "-R", p.Username+":"+p.Username, p.RootPath)
+	// Atomic rename
+	if err := os.Rename(tempLink, currentLink); err != nil {
+		os.Remove(tempLink)
+		return comm.JobResult{Success: false, Output: output.String(), Error: "Failed to activate release: " + err.Error()}
+	}
 
-	output.WriteString("Deployment successful\n")
-	return comm.JobResult{Success: true, Output: output.String()}
+	output.WriteString(fmt.Sprintf("Deployment successful! Release: %s\n", p.CommitHash[:12]))
+	return comm.JobResult{
+		Success: true,
+		Output:  output.String(),
+		Data: map[string]interface{}{
+			"release_path": releaseDir,
+		},
+	}
 }
 
 // Script handler
