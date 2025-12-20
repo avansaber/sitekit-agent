@@ -608,6 +608,10 @@ func (e *Executor) handleIssueSSL(ctx context.Context, payload json.RawMessage) 
 		return comm.JobResult{Success: false, Error: err.Error()}
 	}
 
+	if len(p.Domains) == 0 {
+		return comm.JobResult{Success: false, Error: "at least one domain is required"}
+	}
+
 	log.Info().
 		Strs("domains", p.Domains).
 		Msg("Issuing SSL certificate")
