@@ -137,6 +137,7 @@ func (e *Executor) RegisterHandlers() {
 	e.Register("export_database", e.handleExportDatabase)
 	e.Register("import_database", e.handleImportDatabase)
 	e.Register("optimize_database", e.handleOptimizeDatabase)
+	e.Register("database_backup", e.handleDatabaseBackup)
 
 	// Environment
 	e.Register("update_env_file", e.handleUpdateEnvFile)

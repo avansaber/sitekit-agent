@@ -1626,6 +1626,90 @@ func (e *Executor) handleRevertFirewallRule(ctx context.Context, payload json.Ra
 	}
 }
 
+// Database backup handler
+
+func (e *Executor) handleDatabaseBackup(ctx context.Context, payload json.RawMessage) comm.JobResult {
+	var p struct {
+		BackupID     string `json:"backup_id"`
+		DatabaseID   string `json:"database_id"`
+		DatabaseName string `json:"database_name"`
+		DatabaseType string `json:"database_type"`
+		Filename     string `json:"filename"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+
+	log.Info().
+		Str("backup_id", p.BackupID).
+		Str("database", p.DatabaseName).
+		Str("type", p.DatabaseType).
+		Msg("Creating database backup")
+
+	// Create backup directory
+	backupDir := "/opt/hostman/backups/databases"
+	if err := os.MkdirAll(backupDir, 0700); err != nil {
+		return comm.JobResult{Success: false, Error: "Failed to create backup directory: " + err.Error()}
+	}
+
+	outputFile := filepath.Join(backupDir, p.Filename)
+	uncompressedFile := strings.TrimSuffix(outputFile, ".gz")
+
+	var cmd string
+	switch p.DatabaseType {
+	case "mysql", "mariadb":
+		cmd = fmt.Sprintf("mysqldump --single-transaction --quick --lock-tables=false %s > %s", p.DatabaseName, uncompressedFile)
+	case "postgresql":
+		cmd = fmt.Sprintf("sudo -u postgres pg_dump --format=plain %s > %s", p.DatabaseName, uncompressedFile)
+	default:
+		return comm.JobResult{Success: false, Error: fmt.Sprintf("unsupported database type: %s", p.DatabaseType)}
+	}
+
+	output, exitCode, err := e.RunCommandWithExitCode(ctx, "bash", "-c", cmd)
+	if err != nil {
+		return comm.JobResult{
+			Success:  false,
+			Output:   output,
+			Error:    "Backup failed: " + err.Error(),
+			ExitCode: exitCode,
+		}
+	}
+
+	// Compress the backup
+	if strings.HasSuffix(p.Filename, ".gz") {
+		_, _, gzErr := e.RunCommandWithExitCode(ctx, "gzip", "-f", uncompressedFile)
+		if gzErr != nil {
+			return comm.JobResult{
+				Success: false,
+				Output:  output,
+				Error:   "Failed to compress backup: " + gzErr.Error(),
+			}
+		}
+	}
+
+	// Get file size
+	fileInfo, err := os.Stat(outputFile)
+	var sizeBytes int64
+	if err == nil {
+		sizeBytes = fileInfo.Size()
+	}
+
+	log.Info().
+		Str("backup_id", p.BackupID).
+		Str("path", outputFile).
+		Int64("size_bytes", sizeBytes).
+		Msg("Database backup completed")
+
+	return comm.JobResult{
+		Success: true,
+		Output:  outputFile,
+		Data: map[string]interface{}{
+			"path":       outputFile,
+			"size_bytes": sizeBytes,
+		},
+	}
+}
+
 // Environment file handler
 
 func (e *Executor) handleUpdateEnvFile(ctx context.Context, payload json.RawMessage) comm.JobResult {
