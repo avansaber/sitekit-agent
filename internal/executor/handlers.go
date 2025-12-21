@@ -539,12 +539,13 @@ func (e *Executor) handleCreateWebApp(ctx context.Context, payload json.RawMessa
 
 func (e *Executor) handleUpdateWebAppConfig(ctx context.Context, payload json.RawMessage) comm.JobResult {
 	var p struct {
-		AppID       string `json:"app_id"`
-		Domain      string `json:"domain"`
-		PhpVersion  string `json:"php_version"`
-		NginxConfig string `json:"nginx_config"`
-		FpmConfig   string `json:"fpm_config"`
-		Username    string `json:"username"`
+		AppID         string `json:"app_id"`
+		Domain        string `json:"domain"`
+		PhpVersion    string `json:"php_version"`
+		OldPhpVersion string `json:"old_php_version"`
+		NginxConfig   string `json:"nginx_config"`
+		FpmConfig     string `json:"fpm_config"`
+		Username      string `json:"username"`
 	}
 	if err := json.Unmarshal(payload, &p); err != nil {
 		return comm.JobResult{Success: false, Error: err.Error()}
@@ -558,6 +559,18 @@ func (e *Executor) handleUpdateWebAppConfig(ctx context.Context, payload json.Ra
 		return comm.JobResult{Success: false, Error: fmt.Sprintf("failed to write nginx config: %v", err)}
 	}
 	output.WriteString("Nginx config updated\n")
+
+	// If PHP version changed, remove old FPM pool config
+	if p.OldPhpVersion != "" && p.OldPhpVersion != p.PhpVersion {
+		oldFpmPath := fmt.Sprintf("/etc/php/%s/fpm/pool.d/%s.conf", p.OldPhpVersion, p.Username)
+		if err := os.Remove(oldFpmPath); err != nil && !os.IsNotExist(err) {
+			log.Warn().Err(err).Str("path", oldFpmPath).Msg("Failed to remove old FPM pool config")
+		} else {
+			output.WriteString(fmt.Sprintf("Removed old PHP %s FPM pool config\n", p.OldPhpVersion))
+		}
+		// Reload old PHP-FPM to release resources
+		e.RunCommand(ctx, "systemctl", "reload", fmt.Sprintf("php%s-fpm", p.OldPhpVersion))
+	}
 
 	// Update PHP-FPM config if provided
 	if p.FpmConfig != "" {
@@ -1074,6 +1087,7 @@ func (e *Executor) handleDeploy(ctx context.Context, payload json.RawMessage) co
 	var p struct {
 		DeploymentID      string   `json:"deployment_id"`
 		AppPath           string   `json:"app_path"`
+		Username          string   `json:"username"`
 		Repository        string   `json:"repository"`
 		Branch            string   `json:"branch"`
 		CommitHash        string   `json:"commit_hash"`
@@ -1126,6 +1140,14 @@ func (e *Executor) handleDeploy(ctx context.Context, payload json.RawMessage) co
 	output.WriteString(out + "\n")
 	if err != nil {
 		return comm.JobResult{Success: false, Output: output.String(), Error: "Clone failed: " + err.Error()}
+	}
+
+	// Set ownership for the app directory
+	if p.Username != "" {
+		output.WriteString(fmt.Sprintf("Setting ownership to %s...\n", p.Username))
+		if out, err := e.RunCommand(ctx, "chown", "-R", p.Username+":"+p.Username, p.AppPath); err != nil {
+			log.Warn().Err(err).Str("output", out).Msg("Failed to set ownership")
+		}
 	}
 
 	// Setup shared directories (create in shared and symlink to release)
