@@ -446,13 +446,30 @@ func (e *Executor) handleCreateWebApp(ctx context.Context, payload json.RawMessa
 
 	var output strings.Builder
 
+	// Create home directory first (useradd needs it to exist or be creatable)
+	if err := os.MkdirAll(p.RootPath, 0755); err != nil {
+		return comm.JobResult{Success: false, Error: fmt.Sprintf("failed to create home directory %s: %v", p.RootPath, err)}
+	}
+
+	// Create system user if it doesn't exist
+	if _, _, err := e.RunCommandWithExitCode(ctx, "id", p.Username); err != nil {
+		// User doesn't exist, create it (don't use -m since we already created the directory)
+		out, _, err := e.RunCommandWithExitCode(ctx, "useradd", "-r", "-d", p.RootPath, "-s", "/bin/bash", p.Username)
+		if err != nil {
+			return comm.JobResult{Success: false, Error: fmt.Sprintf("failed to create user %s: %v - %s", p.Username, err, out)}
+		}
+		output.WriteString(fmt.Sprintf("Created system user: %s\n", p.Username))
+	} else {
+		output.WriteString(fmt.Sprintf("User %s already exists\n", p.Username))
+	}
+
 	// Create directory structure
 	dirs := []string{
 		p.RootPath,
 		filepath.Join(p.RootPath, "releases"),
 		filepath.Join(p.RootPath, "shared"),
 		filepath.Join(p.RootPath, "logs"),
-		filepath.Dir(p.PublicPath),
+		filepath.Join(p.RootPath, "current", p.PublicPath),
 	}
 	for _, dir := range dirs {
 		if err := os.MkdirAll(dir, 0755); err != nil {
@@ -477,11 +494,28 @@ func (e *Executor) handleCreateWebApp(ctx context.Context, payload json.RawMessa
 
 	// Write PHP-FPM pool config if PHP app
 	if p.AppType == "php" && p.FpmConfig != "" {
+		// Create FPM log directory
+		fpmLogDir := fmt.Sprintf("/var/log/php%s-fpm", p.PhpVersion)
+		if err := os.MkdirAll(fpmLogDir, 0755); err != nil {
+			return comm.JobResult{Success: false, Error: fmt.Sprintf("failed to create fpm log dir: %v", err)}
+		}
+
 		fpmPath := fmt.Sprintf("/etc/php/%s/fpm/pool.d/%s.conf", p.PhpVersion, p.Username)
 		if err := os.WriteFile(fpmPath, []byte(p.FpmConfig), 0644); err != nil {
 			return comm.JobResult{Success: false, Error: fmt.Sprintf("failed to write fpm config: %v", err)}
 		}
 		output.WriteString("PHP-FPM pool config installed\n")
+
+		// Create default index.php if no files exist
+		indexPath := filepath.Join(p.RootPath, "current", p.PublicPath, "index.php")
+		if _, err := os.Stat(indexPath); os.IsNotExist(err) {
+			defaultIndex := fmt.Sprintf("<?php\necho '<h1>Welcome to %s</h1>';\necho '<p>PHP Version: ' . phpversion() . '</p>';\necho '<p>Server Time: ' . date('Y-m-d H:i:s') . '</p>';\n", p.Domain)
+			if err := os.WriteFile(indexPath, []byte(defaultIndex), 0644); err != nil {
+				output.WriteString(fmt.Sprintf("Warning: failed to create default index.php: %v\n", err))
+			} else {
+				output.WriteString("Created default index.php\n")
+			}
+		}
 
 		// Reload PHP-FPM
 		e.RunCommand(ctx, "systemctl", "reload", fmt.Sprintf("php%s-fpm", p.PhpVersion))
