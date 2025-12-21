@@ -1797,3 +1797,868 @@ func (e *Executor) handleUpdateEnvFile(ctx context.Context, payload json.RawMess
 		Output:  fmt.Sprintf("Updated %s", envPath),
 	}
 }
+
+// Supervisor handlers
+
+func (e *Executor) handleSupervisorCreate(ctx context.Context, payload json.RawMessage) comm.JobResult {
+	var p struct {
+		ProgramID string `json:"program_id"`
+		Name      string `json:"name"`
+		Config    string `json:"config"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+
+	var output strings.Builder
+
+	// Write supervisor config
+	configPath := fmt.Sprintf("/etc/supervisor/conf.d/%s.conf", p.Name)
+	if err := os.WriteFile(configPath, []byte(p.Config), 0644); err != nil {
+		return comm.JobResult{Success: false, Error: fmt.Sprintf("failed to write config: %v", err)}
+	}
+	output.WriteString(fmt.Sprintf("Created config: %s\n", configPath))
+
+	// Reread supervisor config
+	out, _, err := e.RunCommandWithExitCode(ctx, "supervisorctl", "reread")
+	output.WriteString(out + "\n")
+	if err != nil {
+		return comm.JobResult{Success: false, Output: output.String(), Error: "failed to reread supervisor config"}
+	}
+
+	// Update (add new programs)
+	out, _, err = e.RunCommandWithExitCode(ctx, "supervisorctl", "update")
+	output.WriteString(out + "\n")
+	if err != nil {
+		return comm.JobResult{Success: false, Output: output.String(), Error: "failed to update supervisor"}
+	}
+
+	output.WriteString(fmt.Sprintf("Program %s created and started\n", p.Name))
+
+	return comm.JobResult{
+		Success: true,
+		Output:  output.String(),
+	}
+}
+
+func (e *Executor) handleSupervisorUpdate(ctx context.Context, payload json.RawMessage) comm.JobResult {
+	var p struct {
+		ProgramID string `json:"program_id"`
+		Name      string `json:"name"`
+		Config    string `json:"config"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+
+	var output strings.Builder
+
+	// Write updated config
+	configPath := fmt.Sprintf("/etc/supervisor/conf.d/%s.conf", p.Name)
+	if err := os.WriteFile(configPath, []byte(p.Config), 0644); err != nil {
+		return comm.JobResult{Success: false, Error: fmt.Sprintf("failed to write config: %v", err)}
+	}
+	output.WriteString(fmt.Sprintf("Updated config: %s\n", configPath))
+
+	// Reread and update
+	e.RunCommandWithExitCode(ctx, "supervisorctl", "reread")
+	out, _, err := e.RunCommandWithExitCode(ctx, "supervisorctl", "update")
+	output.WriteString(out + "\n")
+	if err != nil {
+		return comm.JobResult{Success: false, Output: output.String(), Error: "failed to update supervisor"}
+	}
+
+	// Restart the program to apply changes
+	out, _, _ = e.RunCommandWithExitCode(ctx, "supervisorctl", "restart", p.Name+":")
+	output.WriteString(out + "\n")
+
+	output.WriteString(fmt.Sprintf("Program %s updated\n", p.Name))
+
+	return comm.JobResult{
+		Success: true,
+		Output:  output.String(),
+	}
+}
+
+func (e *Executor) handleSupervisorDelete(ctx context.Context, payload json.RawMessage) comm.JobResult {
+	var p struct {
+		ProgramID string `json:"program_id"`
+		Name      string `json:"name"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+
+	var output strings.Builder
+
+	// Stop the program first
+	out, _, _ := e.RunCommandWithExitCode(ctx, "supervisorctl", "stop", p.Name+":")
+	output.WriteString(out + "\n")
+
+	// Remove config file
+	configPath := fmt.Sprintf("/etc/supervisor/conf.d/%s.conf", p.Name)
+	if err := os.Remove(configPath); err != nil && !os.IsNotExist(err) {
+		output.WriteString(fmt.Sprintf("Warning: failed to remove config: %v\n", err))
+	} else {
+		output.WriteString(fmt.Sprintf("Removed config: %s\n", configPath))
+	}
+
+	// Update supervisor
+	e.RunCommandWithExitCode(ctx, "supervisorctl", "reread")
+	out, _, _ = e.RunCommandWithExitCode(ctx, "supervisorctl", "update")
+	output.WriteString(out + "\n")
+
+	output.WriteString(fmt.Sprintf("Program %s deleted\n", p.Name))
+
+	return comm.JobResult{
+		Success: true,
+		Output:  output.String(),
+	}
+}
+
+func (e *Executor) handleSupervisorStart(ctx context.Context, payload json.RawMessage) comm.JobResult {
+	var p struct {
+		ProgramID string `json:"program_id"`
+		Name      string `json:"name"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+
+	out, exitCode, err := e.RunCommandWithExitCode(ctx, "supervisorctl", "start", p.Name+":")
+
+	return comm.JobResult{
+		Success:  err == nil,
+		Output:   out,
+		Error:    errToString(err),
+		ExitCode: exitCode,
+	}
+}
+
+func (e *Executor) handleSupervisorStop(ctx context.Context, payload json.RawMessage) comm.JobResult {
+	var p struct {
+		ProgramID string `json:"program_id"`
+		Name      string `json:"name"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+
+	out, exitCode, err := e.RunCommandWithExitCode(ctx, "supervisorctl", "stop", p.Name+":")
+
+	return comm.JobResult{
+		Success:  err == nil,
+		Output:   out,
+		Error:    errToString(err),
+		ExitCode: exitCode,
+	}
+}
+
+func (e *Executor) handleSupervisorRestart(ctx context.Context, payload json.RawMessage) comm.JobResult {
+	var p struct {
+		ProgramID string `json:"program_id"`
+		Name      string `json:"name"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+
+	out, exitCode, err := e.RunCommandWithExitCode(ctx, "supervisorctl", "restart", p.Name+":")
+
+	return comm.JobResult{
+		Success:  err == nil,
+		Output:   out,
+		Error:    errToString(err),
+		ExitCode: exitCode,
+	}
+}
+
+// Apache handlers (for nginx_apache hybrid mode)
+
+func (e *Executor) handleCreateApacheVhost(ctx context.Context, payload json.RawMessage) comm.JobResult {
+	var p struct {
+		AppID       string `json:"app_id"`
+		Domain      string `json:"domain"`
+		Config      string `json:"config"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+
+	var output strings.Builder
+
+	// Write Apache vhost config
+	configPath := fmt.Sprintf("/etc/apache2/sites-available/%s.conf", p.Domain)
+	if err := os.WriteFile(configPath, []byte(p.Config), 0644); err != nil {
+		return comm.JobResult{Success: false, Error: fmt.Sprintf("failed to write apache config: %v", err)}
+	}
+	output.WriteString(fmt.Sprintf("Created Apache config: %s\n", configPath))
+
+	// Enable the site
+	out, _, err := e.RunCommandWithExitCode(ctx, "a2ensite", p.Domain+".conf")
+	output.WriteString(out + "\n")
+	if err != nil {
+		return comm.JobResult{Success: false, Output: output.String(), Error: "failed to enable apache site"}
+	}
+
+	// Test Apache config
+	out, _, err = e.RunCommandWithExitCode(ctx, "apache2ctl", "configtest")
+	output.WriteString(out + "\n")
+	if err != nil {
+		// Disable site if config test fails
+		e.RunCommandWithExitCode(ctx, "a2dissite", p.Domain+".conf")
+		os.Remove(configPath)
+		return comm.JobResult{Success: false, Output: output.String(), Error: "apache config test failed"}
+	}
+
+	// Reload Apache
+	e.RunCommandWithExitCode(ctx, "systemctl", "reload", "apache2")
+	output.WriteString("Apache reloaded\n")
+
+	return comm.JobResult{
+		Success: true,
+		Output:  output.String(),
+	}
+}
+
+func (e *Executor) handleUpdateApacheVhost(ctx context.Context, payload json.RawMessage) comm.JobResult {
+	var p struct {
+		AppID  string `json:"app_id"`
+		Domain string `json:"domain"`
+		Config string `json:"config"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+
+	var output strings.Builder
+
+	// Write updated config
+	configPath := fmt.Sprintf("/etc/apache2/sites-available/%s.conf", p.Domain)
+	if err := os.WriteFile(configPath, []byte(p.Config), 0644); err != nil {
+		return comm.JobResult{Success: false, Error: fmt.Sprintf("failed to write apache config: %v", err)}
+	}
+	output.WriteString(fmt.Sprintf("Updated Apache config: %s\n", configPath))
+
+	// Test Apache config
+	out, _, err := e.RunCommandWithExitCode(ctx, "apache2ctl", "configtest")
+	output.WriteString(out + "\n")
+	if err != nil {
+		return comm.JobResult{Success: false, Output: output.String(), Error: "apache config test failed"}
+	}
+
+	// Reload Apache
+	e.RunCommandWithExitCode(ctx, "systemctl", "reload", "apache2")
+	output.WriteString("Apache reloaded\n")
+
+	return comm.JobResult{
+		Success: true,
+		Output:  output.String(),
+	}
+}
+
+func (e *Executor) handleDeleteApacheVhost(ctx context.Context, payload json.RawMessage) comm.JobResult {
+	var p struct {
+		AppID  string `json:"app_id"`
+		Domain string `json:"domain"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+
+	var output strings.Builder
+
+	// Disable the site
+	out, _, _ := e.RunCommandWithExitCode(ctx, "a2dissite", p.Domain+".conf")
+	output.WriteString(out + "\n")
+
+	// Remove config file
+	configPath := fmt.Sprintf("/etc/apache2/sites-available/%s.conf", p.Domain)
+	if err := os.Remove(configPath); err != nil && !os.IsNotExist(err) {
+		output.WriteString(fmt.Sprintf("Warning: failed to remove config: %v\n", err))
+	} else {
+		output.WriteString(fmt.Sprintf("Removed config: %s\n", configPath))
+	}
+
+	// Reload Apache
+	e.RunCommandWithExitCode(ctx, "systemctl", "reload", "apache2")
+	output.WriteString("Apache reloaded\n")
+
+	return comm.JobResult{
+		Success: true,
+		Output:  output.String(),
+	}
+}
+
+// File Manager handlers
+
+func (e *Executor) handleListDirectory(ctx context.Context, payload json.RawMessage) comm.JobResult {
+	var p struct {
+		Path     string `json:"path"`
+		BasePath string `json:"base_path"` // Security: only allow operations within this path
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+
+	// Security: validate path is within base path
+	if !isPathWithin(p.Path, p.BasePath) {
+		return comm.JobResult{Success: false, Error: "access denied: path outside allowed directory"}
+	}
+
+	entries, err := os.ReadDir(p.Path)
+	if err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+
+	type FileInfo struct {
+		Name        string `json:"name"`
+		IsDirectory bool   `json:"is_directory"`
+		Size        int64  `json:"size"`
+		ModTime     string `json:"mod_time"`
+		Permissions string `json:"permissions"`
+	}
+
+	files := make([]FileInfo, 0, len(entries))
+	for _, entry := range entries {
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		files = append(files, FileInfo{
+			Name:        entry.Name(),
+			IsDirectory: entry.IsDir(),
+			Size:        info.Size(),
+			ModTime:     info.ModTime().Format("2006-01-02 15:04:05"),
+			Permissions: info.Mode().String(),
+		})
+	}
+
+	filesJSON, _ := json.Marshal(files)
+
+	return comm.JobResult{
+		Success: true,
+		Output:  string(filesJSON),
+		Data:    map[string]interface{}{"files": files},
+	}
+}
+
+func (e *Executor) handleReadFile(ctx context.Context, payload json.RawMessage) comm.JobResult {
+	var p struct {
+		Path      string `json:"path"`
+		BasePath  string `json:"base_path"`
+		MaxBytes  int64  `json:"max_bytes"` // Limit file size to read
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+
+	// Security: validate path is within base path
+	if !isPathWithin(p.Path, p.BasePath) {
+		return comm.JobResult{Success: false, Error: "access denied: path outside allowed directory"}
+	}
+
+	// Check file size first
+	info, err := os.Stat(p.Path)
+	if err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+
+	if info.IsDir() {
+		return comm.JobResult{Success: false, Error: "cannot read directory as file"}
+	}
+
+	maxBytes := p.MaxBytes
+	if maxBytes <= 0 {
+		maxBytes = 1024 * 1024 // Default 1MB limit
+	}
+
+	if info.Size() > maxBytes {
+		return comm.JobResult{
+			Success: false,
+			Error:   fmt.Sprintf("file too large: %d bytes (max: %d)", info.Size(), maxBytes),
+		}
+	}
+
+	content, err := os.ReadFile(p.Path)
+	if err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+
+	return comm.JobResult{
+		Success: true,
+		Output:  string(content),
+		Data: map[string]interface{}{
+			"size":     info.Size(),
+			"mod_time": info.ModTime().Format("2006-01-02 15:04:05"),
+		},
+	}
+}
+
+func (e *Executor) handleWriteFile(ctx context.Context, payload json.RawMessage) comm.JobResult {
+	var p struct {
+		Path     string `json:"path"`
+		BasePath string `json:"base_path"`
+		Content  string `json:"content"`
+		Mode     string `json:"mode"` // Optional: file mode as string e.g. "0644"
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+
+	// Security: validate path is within base path
+	if !isPathWithin(p.Path, p.BasePath) {
+		return comm.JobResult{Success: false, Error: "access denied: path outside allowed directory"}
+	}
+
+	// Determine file mode
+	mode := os.FileMode(0644)
+	if p.Mode != "" {
+		var modeInt int
+		fmt.Sscanf(p.Mode, "%o", &modeInt)
+		mode = os.FileMode(modeInt)
+	}
+
+	// Create parent directories if needed
+	parentDir := filepath.Dir(p.Path)
+	if err := os.MkdirAll(parentDir, 0755); err != nil {
+		return comm.JobResult{Success: false, Error: fmt.Sprintf("failed to create parent directory: %v", err)}
+	}
+
+	// Write file
+	if err := os.WriteFile(p.Path, []byte(p.Content), mode); err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+
+	log.Info().Str("path", p.Path).Int("size", len(p.Content)).Msg("File written")
+
+	return comm.JobResult{
+		Success: true,
+		Output:  fmt.Sprintf("File written: %s (%d bytes)", p.Path, len(p.Content)),
+	}
+}
+
+func (e *Executor) handleDeleteFile(ctx context.Context, payload json.RawMessage) comm.JobResult {
+	var p struct {
+		Path      string `json:"path"`
+		BasePath  string `json:"base_path"`
+		Recursive bool   `json:"recursive"` // For directories
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+
+	// Security: validate path is within base path
+	if !isPathWithin(p.Path, p.BasePath) {
+		return comm.JobResult{Success: false, Error: "access denied: path outside allowed directory"}
+	}
+
+	// Prevent deleting the base path itself
+	absPath, _ := filepath.Abs(p.Path)
+	absBase, _ := filepath.Abs(p.BasePath)
+	if absPath == absBase {
+		return comm.JobResult{Success: false, Error: "cannot delete the base directory"}
+	}
+
+	var err error
+	if p.Recursive {
+		err = os.RemoveAll(p.Path)
+	} else {
+		err = os.Remove(p.Path)
+	}
+
+	if err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+
+	log.Info().Str("path", p.Path).Bool("recursive", p.Recursive).Msg("File/directory deleted")
+
+	return comm.JobResult{
+		Success: true,
+		Output:  fmt.Sprintf("Deleted: %s", p.Path),
+	}
+}
+
+func (e *Executor) handleCreateDirectory(ctx context.Context, payload json.RawMessage) comm.JobResult {
+	var p struct {
+		Path     string `json:"path"`
+		BasePath string `json:"base_path"`
+		Mode     string `json:"mode"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+
+	// Security: validate path is within base path
+	if !isPathWithin(p.Path, p.BasePath) {
+		return comm.JobResult{Success: false, Error: "access denied: path outside allowed directory"}
+	}
+
+	mode := os.FileMode(0755)
+	if p.Mode != "" {
+		var modeInt int
+		fmt.Sscanf(p.Mode, "%o", &modeInt)
+		mode = os.FileMode(modeInt)
+	}
+
+	if err := os.MkdirAll(p.Path, mode); err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+
+	log.Info().Str("path", p.Path).Msg("Directory created")
+
+	return comm.JobResult{
+		Success: true,
+		Output:  fmt.Sprintf("Directory created: %s", p.Path),
+	}
+}
+
+func (e *Executor) handleRenameFile(ctx context.Context, payload json.RawMessage) comm.JobResult {
+	var p struct {
+		OldPath  string `json:"old_path"`
+		NewPath  string `json:"new_path"`
+		BasePath string `json:"base_path"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+
+	// Security: validate both paths are within base path
+	if !isPathWithin(p.OldPath, p.BasePath) || !isPathWithin(p.NewPath, p.BasePath) {
+		return comm.JobResult{Success: false, Error: "access denied: path outside allowed directory"}
+	}
+
+	if err := os.Rename(p.OldPath, p.NewPath); err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+
+	log.Info().Str("from", p.OldPath).Str("to", p.NewPath).Msg("File renamed")
+
+	return comm.JobResult{
+		Success: true,
+		Output:  fmt.Sprintf("Renamed: %s -> %s", p.OldPath, p.NewPath),
+	}
+}
+
+func (e *Executor) handleGetFileInfo(ctx context.Context, payload json.RawMessage) comm.JobResult {
+	var p struct {
+		Path     string `json:"path"`
+		BasePath string `json:"base_path"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+
+	// Security: validate path is within base path
+	if !isPathWithin(p.Path, p.BasePath) {
+		return comm.JobResult{Success: false, Error: "access denied: path outside allowed directory"}
+	}
+
+	info, err := os.Stat(p.Path)
+	if err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+
+	fileInfo := map[string]interface{}{
+		"name":         info.Name(),
+		"path":         p.Path,
+		"size":         info.Size(),
+		"is_directory": info.IsDir(),
+		"mod_time":     info.ModTime().Format("2006-01-02 15:04:05"),
+		"permissions":  info.Mode().String(),
+	}
+
+	infoJSON, _ := json.Marshal(fileInfo)
+
+	return comm.JobResult{
+		Success: true,
+		Output:  string(infoJSON),
+		Data:    fileInfo,
+	}
+}
+
+func (e *Executor) handleChmodFile(ctx context.Context, payload json.RawMessage) comm.JobResult {
+	var p struct {
+		Path      string `json:"path"`
+		BasePath  string `json:"base_path"`
+		Mode      string `json:"mode"`
+		Recursive bool   `json:"recursive"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+
+	// Security: validate path is within base path
+	if !isPathWithin(p.Path, p.BasePath) {
+		return comm.JobResult{Success: false, Error: "access denied: path outside allowed directory"}
+	}
+
+	var modeInt int
+	fmt.Sscanf(p.Mode, "%o", &modeInt)
+	mode := os.FileMode(modeInt)
+
+	if p.Recursive {
+		output, _, err := e.RunCommandWithExitCode(ctx, "chmod", "-R", p.Mode, p.Path)
+		return comm.JobResult{
+			Success: err == nil,
+			Output:  output,
+			Error:   errToString(err),
+		}
+	}
+
+	if err := os.Chmod(p.Path, mode); err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+
+	return comm.JobResult{
+		Success: true,
+		Output:  fmt.Sprintf("Changed permissions of %s to %s", p.Path, p.Mode),
+	}
+}
+
+// Log Viewer handlers
+
+func (e *Executor) handleListLogs(ctx context.Context, payload json.RawMessage) comm.JobResult {
+	var p struct {
+		LogPath string `json:"log_path"` // Base directory for logs (e.g., /home/app/logs)
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+
+	type LogFile struct {
+		Name     string `json:"name"`
+		Path     string `json:"path"`
+		Size     int64  `json:"size"`
+		ModTime  string `json:"mod_time"`
+	}
+
+	var logs []LogFile
+
+	// Walk through log directory
+	err := filepath.Walk(p.LogPath, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil // Skip files we can't access
+		}
+		if info.IsDir() {
+			return nil
+		}
+
+		// Only include common log file extensions
+		ext := strings.ToLower(filepath.Ext(info.Name()))
+		if ext == ".log" || ext == ".txt" || strings.HasSuffix(info.Name(), ".log.1") ||
+			strings.HasSuffix(info.Name(), ".log.2") || info.Name() == "error_log" ||
+			info.Name() == "access_log" {
+			logs = append(logs, LogFile{
+				Name:    info.Name(),
+				Path:    path,
+				Size:    info.Size(),
+				ModTime: info.ModTime().Format("2006-01-02 15:04:05"),
+			})
+		}
+		return nil
+	})
+
+	if err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+
+	// Also check common system log locations for the app
+	systemLogs := []string{
+		fmt.Sprintf("/var/log/nginx/%s-access.log", filepath.Base(p.LogPath)),
+		fmt.Sprintf("/var/log/nginx/%s-error.log", filepath.Base(p.LogPath)),
+	}
+
+	for _, logPath := range systemLogs {
+		if info, err := os.Stat(logPath); err == nil && !info.IsDir() {
+			logs = append(logs, LogFile{
+				Name:    filepath.Base(logPath),
+				Path:    logPath,
+				Size:    info.Size(),
+				ModTime: info.ModTime().Format("2006-01-02 15:04:05"),
+			})
+		}
+	}
+
+	logsJSON, _ := json.Marshal(logs)
+
+	return comm.JobResult{
+		Success: true,
+		Output:  string(logsJSON),
+		Data:    map[string]interface{}{"logs": logs},
+	}
+}
+
+func (e *Executor) handleTailLog(ctx context.Context, payload json.RawMessage) comm.JobResult {
+	var p struct {
+		Path     string `json:"path"`
+		Lines    int    `json:"lines"`     // Number of lines to tail (default 100)
+		Follow   bool   `json:"follow"`    // Not used in sync mode, but for future SSE support
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+
+	lines := p.Lines
+	if lines <= 0 {
+		lines = 100
+	}
+	if lines > 1000 {
+		lines = 1000 // Max 1000 lines
+	}
+
+	// Use tail command for efficiency
+	output, exitCode, err := e.RunCommandWithExitCode(ctx, "tail", "-n", fmt.Sprintf("%d", lines), p.Path)
+
+	return comm.JobResult{
+		Success:  err == nil,
+		Output:   output,
+		Error:    errToString(err),
+		ExitCode: exitCode,
+	}
+}
+
+func (e *Executor) handleSearchLog(ctx context.Context, payload json.RawMessage) comm.JobResult {
+	var p struct {
+		Path    string `json:"path"`
+		Pattern string `json:"pattern"`
+		Lines   int    `json:"lines"` // Max lines to return
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+
+	lines := p.Lines
+	if lines <= 0 {
+		lines = 100
+	}
+	if lines > 500 {
+		lines = 500
+	}
+
+	// Use grep for searching
+	output, exitCode, err := e.RunCommandWithExitCode(ctx, "grep", "-n", "-m", fmt.Sprintf("%d", lines), p.Pattern, p.Path)
+
+	// grep returns exit code 1 when no matches found - this is not an error
+	if exitCode == 1 && output == "" {
+		return comm.JobResult{
+			Success: true,
+			Output:  "No matches found",
+		}
+	}
+
+	return comm.JobResult{
+		Success:  err == nil || exitCode == 1,
+		Output:   output,
+		Error:    errToString(err),
+		ExitCode: exitCode,
+	}
+}
+
+func (e *Executor) handleClearLog(ctx context.Context, payload json.RawMessage) comm.JobResult {
+	var p struct {
+		Path     string `json:"path"`
+		BasePath string `json:"base_path"` // Security: only allow operations within this path
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+
+	// Security: validate path is within base path
+	if p.BasePath != "" && !isPathWithin(p.Path, p.BasePath) {
+		return comm.JobResult{Success: false, Error: "access denied: path outside allowed directory"}
+	}
+
+	// Truncate the log file instead of deleting it
+	if err := os.Truncate(p.Path, 0); err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+
+	log.Info().Str("path", p.Path).Msg("Log file cleared")
+
+	return comm.JobResult{
+		Success: true,
+		Output:  fmt.Sprintf("Log file cleared: %s", p.Path),
+	}
+}
+
+func (e *Executor) handleDownloadLog(ctx context.Context, payload json.RawMessage) comm.JobResult {
+	var p struct {
+		Path       string `json:"path"`
+		OutputPath string `json:"output_path"` // Where to save the compressed log
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+
+	// Default output path
+	outputPath := p.OutputPath
+	if outputPath == "" {
+		outputPath = p.Path + ".gz"
+	}
+
+	// Compress the log file
+	output, exitCode, err := e.RunCommandWithExitCode(ctx, "gzip", "-c", p.Path)
+	if err != nil {
+		return comm.JobResult{
+			Success:  false,
+			Output:   output,
+			Error:    err.Error(),
+			ExitCode: exitCode,
+		}
+	}
+
+	// Write compressed content
+	if err := os.WriteFile(outputPath, []byte(output), 0644); err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+
+	// Get file size
+	info, _ := os.Stat(outputPath)
+	var size int64
+	if info != nil {
+		size = info.Size()
+	}
+
+	return comm.JobResult{
+		Success: true,
+		Output:  outputPath,
+		Data: map[string]interface{}{
+			"path":       outputPath,
+			"size_bytes": size,
+		},
+	}
+}
+
+// Helper function to check if a path is within a base path (prevent path traversal)
+func isPathWithin(path, basePath string) bool {
+	if basePath == "" {
+		return false
+	}
+
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return false
+	}
+
+	absBase, err := filepath.Abs(basePath)
+	if err != nil {
+		return false
+	}
+
+	// Clean and compare paths
+	absPath = filepath.Clean(absPath)
+	absBase = filepath.Clean(absBase)
+
+	// Path must start with base path
+	if !strings.HasPrefix(absPath, absBase) {
+		return false
+	}
+
+	// Ensure it's not just a prefix match (e.g., /home/user vs /home/username)
+	if len(absPath) > len(absBase) && absPath[len(absBase)] != filepath.Separator {
+		return false
+	}
+
+	return true
+}

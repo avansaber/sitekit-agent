@@ -150,6 +150,36 @@ func (e *Executor) RegisterHandlers() {
 	e.Register("rollback_deployment", e.handleRollbackDeployment)
 	e.Register("cleanup_releases", e.handleCleanupReleases)
 
+	// Supervisor
+	e.Register("supervisor_create", e.handleSupervisorCreate)
+	e.Register("supervisor_update", e.handleSupervisorUpdate)
+	e.Register("supervisor_delete", e.handleSupervisorDelete)
+	e.Register("supervisor_start", e.handleSupervisorStart)
+	e.Register("supervisor_stop", e.handleSupervisorStop)
+	e.Register("supervisor_restart", e.handleSupervisorRestart)
+
+	// Apache (for nginx_apache hybrid mode)
+	e.Register("create_apache_vhost", e.handleCreateApacheVhost)
+	e.Register("update_apache_vhost", e.handleUpdateApacheVhost)
+	e.Register("delete_apache_vhost", e.handleDeleteApacheVhost)
+
+	// File Manager
+	e.Register("list_directory", e.handleListDirectory)
+	e.Register("read_file", e.handleReadFile)
+	e.Register("write_file", e.handleWriteFile)
+	e.Register("delete_file", e.handleDeleteFile)
+	e.Register("create_directory", e.handleCreateDirectory)
+	e.Register("rename_file", e.handleRenameFile)
+	e.Register("get_file_info", e.handleGetFileInfo)
+	e.Register("chmod_file", e.handleChmodFile)
+
+	// Log Viewer
+	e.Register("list_logs", e.handleListLogs)
+	e.Register("tail_log", e.handleTailLog)
+	e.Register("search_log", e.handleSearchLog)
+	e.Register("clear_log", e.handleClearLog)
+	e.Register("download_log", e.handleDownloadLog)
+
 	// Generic command (use with caution)
 	e.Register("run_script", e.handleRunScript)
 
