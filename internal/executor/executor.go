@@ -147,6 +147,7 @@ func (e *Executor) RegisterHandlers() {
 
 	// Deployment
 	e.Register("deploy", e.handleDeploy)
+	e.Register("git_deploy", e.handleDeploy) // Alias for deploy
 	e.Register("rollback_deployment", e.handleRollbackDeployment)
 	e.Register("cleanup_releases", e.handleCleanupReleases)
 
@@ -182,6 +183,9 @@ func (e *Executor) RegisterHandlers() {
 
 	// Generic command (use with caution)
 	e.Register("run_script", e.handleRunScript)
+
+	// Health monitoring
+	e.Register("check_services", e.handleCheckServices)
 
 	log.Info().Int("handlers", len(e.handlers)).Msg("Registered job handlers")
 }

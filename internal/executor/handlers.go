@@ -645,7 +645,7 @@ func (e *Executor) handleDeleteWebApp(ctx context.Context, payload json.RawMessa
 
 func (e *Executor) handleIssueSSL(ctx context.Context, payload json.RawMessage) comm.JobResult {
 	var p struct {
-		CertID    string   `json:"cert_id"`
+		CertID    string   `json:"certificate_id"` // Match SaaS payload
 		Domains   []string `json:"domains"`
 		Email     string   `json:"email"`
 		Webroot   string   `json:"webroot"`
@@ -787,6 +787,25 @@ func (e *Executor) handleInstallSSL(ctx context.Context, payload json.RawMessage
 
 // Database handlers
 
+// getMySQLRootPassword reads the MySQL root password from the config file
+func getMySQLRootPassword() string {
+	data, err := os.ReadFile("/opt/hostman/config/.mysql_root")
+	if err != nil {
+		log.Warn().Err(err).Msg("Failed to read MySQL root password file")
+		return ""
+	}
+	return strings.TrimSpace(string(data))
+}
+
+// getMySQLArgs returns the common args for MySQL commands with authentication
+func getMySQLArgs(query string) []string {
+	password := getMySQLRootPassword()
+	if password != "" {
+		return []string{"-u", "root", "-p" + password, "-e", query}
+	}
+	return []string{"-e", query}
+}
+
 func (e *Executor) handleCreateDatabase(ctx context.Context, payload json.RawMessage) comm.JobResult {
 	var p struct {
 		DatabaseID   string `json:"database_id"`
@@ -811,7 +830,7 @@ func (e *Executor) handleCreateDatabase(ctx context.Context, payload json.RawMes
 	case "mysql", "mariadb":
 		// Create database
 		createDB := fmt.Sprintf("CREATE DATABASE IF NOT EXISTS `%s` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;", p.DatabaseName)
-		out, _, err := e.RunCommandWithExitCode(ctx, "mysql", "-e", createDB)
+		out, _, err := e.RunCommandWithExitCode(ctx, "mysql", getMySQLArgs(createDB)...)
 		output.WriteString(out + "\n")
 		if err != nil {
 			return comm.JobResult{Success: false, Output: output.String(), Error: err.Error()}
@@ -824,14 +843,14 @@ func (e *Executor) handleCreateDatabase(ctx context.Context, payload json.RawMes
 				host = "localhost"
 			}
 			createUser := fmt.Sprintf("CREATE USER IF NOT EXISTS '%s'@'%s' IDENTIFIED BY '%s';", p.Username, host, p.Password)
-			out, _, err = e.RunCommandWithExitCode(ctx, "mysql", "-e", createUser)
+			out, _, err = e.RunCommandWithExitCode(ctx, "mysql", getMySQLArgs(createUser)...)
 			output.WriteString(out + "\n")
 			if err != nil {
 				return comm.JobResult{Success: false, Output: output.String(), Error: err.Error()}
 			}
 
 			grant := fmt.Sprintf("GRANT ALL PRIVILEGES ON `%s`.* TO '%s'@'%s'; FLUSH PRIVILEGES;", p.DatabaseName, p.Username, host)
-			out, _, err = e.RunCommandWithExitCode(ctx, "mysql", "-e", grant)
+			out, _, err = e.RunCommandWithExitCode(ctx, "mysql", getMySQLArgs(grant)...)
 			output.WriteString(out + "\n")
 			if err != nil {
 				return comm.JobResult{Success: false, Output: output.String(), Error: err.Error()}
@@ -886,13 +905,13 @@ func (e *Executor) handleDeleteDatabase(ctx context.Context, payload json.RawMes
 				host = "localhost"
 			}
 			dropUser := fmt.Sprintf("DROP USER IF EXISTS '%s'@'%s';", p.Username, host)
-			out, _, _ := e.RunCommandWithExitCode(ctx, "mysql", "-e", dropUser)
+			out, _, _ := e.RunCommandWithExitCode(ctx, "mysql", getMySQLArgs(dropUser)...)
 			output.WriteString(out + "\n")
 		}
 
 		// Drop database
 		dropDB := fmt.Sprintf("DROP DATABASE IF EXISTS `%s`;", p.DatabaseName)
-		out, _, err := e.RunCommandWithExitCode(ctx, "mysql", "-e", dropDB)
+		out, _, err := e.RunCommandWithExitCode(ctx, "mysql", getMySQLArgs(dropDB)...)
 		output.WriteString(out + "\n")
 		if err != nil {
 			return comm.JobResult{Success: false, Output: output.String(), Error: err.Error()}
@@ -1221,13 +1240,23 @@ func (e *Executor) handleDeploy(ctx context.Context, payload json.RawMessage) co
 	currentLink := filepath.Join(p.AppPath, "current")
 	tempLink := filepath.Join(p.AppPath, ".current.tmp")
 
+	// Check if current is a directory (not a symlink) and remove it
+	if info, err := os.Lstat(currentLink); err == nil {
+		if info.IsDir() && info.Mode()&os.ModeSymlink == 0 {
+			// It's a real directory, not a symlink - move to releases as backup
+			backupPath := filepath.Join(p.AppPath, "releases", "initial_backup")
+			os.Rename(currentLink, backupPath)
+			output.WriteString("Moved existing current directory to releases/initial_backup\n")
+		}
+	}
+
 	// Create temp symlink
 	os.Remove(tempLink)
 	if err := os.Symlink(releaseDir, tempLink); err != nil {
 		return comm.JobResult{Success: false, Output: output.String(), Error: "Failed to create symlink: " + err.Error()}
 	}
 
-	// Atomic rename
+	// Atomic rename (this works when replacing a symlink or when target doesn't exist)
 	if err := os.Rename(tempLink, currentLink); err != nil {
 		os.Remove(tempLink)
 		return comm.JobResult{Success: false, Output: output.String(), Error: "Failed to activate release: " + err.Error()}
@@ -1307,6 +1336,8 @@ func getSystemdServiceName(serviceType, version string) string {
 		return "nginx"
 	case "supervisor":
 		return "supervisor"
+	case "beanstalkd":
+		return "beanstalkd"
 	default:
 		return serviceType
 	}
@@ -1488,6 +1519,10 @@ func (e *Executor) handleExportDatabase(ctx context.Context, payload json.RawMes
 	switch p.Type {
 	case "mysql", "mariadb":
 		args := []string{}
+		password := getMySQLRootPassword()
+		if password != "" {
+			args = append(args, "-u", "root", "-p'"+password+"'")
+		}
 		if !p.IncludeData {
 			args = append(args, "--no-data")
 		}
@@ -1714,7 +1749,12 @@ func (e *Executor) handleDatabaseBackup(ctx context.Context, payload json.RawMes
 	var cmd string
 	switch p.DatabaseType {
 	case "mysql", "mariadb":
-		cmd = fmt.Sprintf("mysqldump --single-transaction --quick --lock-tables=false %s > %s", p.DatabaseName, uncompressedFile)
+		password := getMySQLRootPassword()
+		if password != "" {
+			cmd = fmt.Sprintf("mysqldump -u root -p'%s' --single-transaction --quick --lock-tables=false %s > %s", password, p.DatabaseName, uncompressedFile)
+		} else {
+			cmd = fmt.Sprintf("mysqldump --single-transaction --quick --lock-tables=false %s > %s", p.DatabaseName, uncompressedFile)
+		}
 	case "postgresql":
 		cmd = fmt.Sprintf("sudo -u postgres pg_dump --format=plain %s > %s", p.DatabaseName, uncompressedFile)
 	default:
@@ -2661,4 +2701,43 @@ func isPathWithin(path, basePath string) bool {
 	}
 
 	return true
+}
+
+// handleCheckServices checks the status of multiple services
+func (e *Executor) handleCheckServices(ctx context.Context, payload json.RawMessage) comm.JobResult {
+	var p struct {
+		Services []string `json:"services"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+
+	log.Info().Strs("services", p.Services).Msg("Checking services status")
+
+	results := make(map[string]interface{})
+	var output strings.Builder
+
+	for _, service := range p.Services {
+		serviceName := getSystemdServiceName(service, "")
+		out, _, err := e.RunCommandWithExitCode(ctx, "systemctl", "is-active", serviceName)
+		status := strings.TrimSpace(out)
+		isRunning := err == nil && status == "active"
+
+		results[service] = map[string]interface{}{
+			"running": isRunning,
+			"status":  status,
+		}
+
+		icon := "✓"
+		if !isRunning {
+			icon = "✗"
+		}
+		output.WriteString(fmt.Sprintf("%s %s: %s\n", icon, service, status))
+	}
+
+	return comm.JobResult{
+		Success: true,
+		Output:  output.String(),
+		Data:    results,
+	}
 }
