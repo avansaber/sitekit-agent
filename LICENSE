@@ -1,0 +1,42 @@
+SiteKit Source Available License
+
+Copyright (c) 2024-2025 AvanSaber
+
+Grant of Rights
+---------------
+
+You are permitted to use, copy, modify, and distribute this software for any
+purpose, subject to the following limitations:
+
+Limitations
+-----------
+
+1. SERVER LIMIT: You may not use this software to manage more than twenty (20)
+   servers without obtaining a commercial license.
+
+2. WEB APPLICATIONS LIMIT: You may not use this software to deploy more than
+   five (5) web applications per server without obtaining a commercial license.
+
+3. REVENUE LIMIT: If you offer this software as a hosted service (SaaS), your
+   annual revenue from such service must not exceed one hundred thousand US
+   dollars ($100,000 USD) without obtaining a commercial license.
+
+4. ATTRIBUTION: You must retain this license notice and attribution in all
+   copies or substantial portions of the software.
+
+Commercial License
+------------------
+
+For usage beyond these limits, please contact licensing@avansaber.com for a
+commercial license.
+
+Warranty Disclaimer
+-------------------
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
