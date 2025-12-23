@@ -8,6 +8,13 @@ import (
 	"github.com/spf13/viper"
 )
 
+type DatabaseConfig struct {
+	Host     string `mapstructure:"host"`
+	Port     int    `mapstructure:"port"`
+	User     string `mapstructure:"user"`
+	Password string `mapstructure:"password"`
+}
+
 type Config struct {
 	SaasURL       string        `mapstructure:"saas_url"`
 	AgentToken    string        `mapstructure:"agent_token"`
@@ -16,6 +23,10 @@ type Config struct {
 	PollInterval  time.Duration `mapstructure:"poll_interval"`
 	StatsInterval time.Duration `mapstructure:"stats_interval"`
 	LogLevel      string        `mapstructure:"log_level"`
+
+	// Database credentials for agent operations
+	MySQL      DatabaseConfig `mapstructure:"mysql"`
+	PostgreSQL DatabaseConfig `mapstructure:"postgresql"`
 }
 
 func LoadConfig() (*Config, error) {
@@ -29,6 +40,14 @@ func LoadConfig() (*Config, error) {
 	viper.SetDefault("poll_interval", "5s")
 	viper.SetDefault("stats_interval", "60s")
 	viper.SetDefault("log_level", "info")
+
+	// Database defaults
+	viper.SetDefault("mysql.host", "localhost")
+	viper.SetDefault("mysql.port", 3306)
+	viper.SetDefault("mysql.user", "sitekit")
+	viper.SetDefault("postgresql.host", "localhost")
+	viper.SetDefault("postgresql.port", 5432)
+	viper.SetDefault("postgresql.user", "sitekit")
 
 	// Environment variable overrides
 	viper.SetEnvPrefix("HOSTMAN")

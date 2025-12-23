@@ -9,8 +9,14 @@ import (
 	"github.com/hostman/hostman-agent/internal/comm"
 )
 
+// testDatabaseConfig returns empty database configs for testing
+func testDatabaseConfig() (DatabaseConfig, DatabaseConfig) {
+	return DatabaseConfig{}, DatabaseConfig{}
+}
+
 func TestExecutorRegisterAndExecute(t *testing.T) {
-	exec := NewExecutor(5 * time.Second)
+	mysqlCfg, pgCfg := testDatabaseConfig()
+	exec := NewExecutor(5*time.Second, mysqlCfg, pgCfg)
 
 	// Register a test handler
 	exec.Register("test_job", func(ctx context.Context, payload json.RawMessage) comm.JobResult {
@@ -37,7 +43,8 @@ func TestExecutorRegisterAndExecute(t *testing.T) {
 }
 
 func TestExecutorUnknownJob(t *testing.T) {
-	exec := NewExecutor(5 * time.Second)
+	mysqlCfg, pgCfg := testDatabaseConfig()
+	exec := NewExecutor(5*time.Second, mysqlCfg, pgCfg)
 
 	result := exec.Execute(context.Background(), "unknown_job", nil)
 
@@ -51,7 +58,8 @@ func TestExecutorUnknownJob(t *testing.T) {
 }
 
 func TestExecutorRunCommand(t *testing.T) {
-	exec := NewExecutor(5 * time.Second)
+	mysqlCfg, pgCfg := testDatabaseConfig()
+	exec := NewExecutor(5*time.Second, mysqlCfg, pgCfg)
 
 	output, err := exec.RunCommand(context.Background(), "echo", "hello")
 	if err != nil {
@@ -64,7 +72,8 @@ func TestExecutorRunCommand(t *testing.T) {
 }
 
 func TestExecutorRunCommandTimeout(t *testing.T) {
-	exec := NewExecutor(100 * time.Millisecond)
+	mysqlCfg, pgCfg := testDatabaseConfig()
+	exec := NewExecutor(100*time.Millisecond, mysqlCfg, pgCfg)
 
 	_, err := exec.RunCommand(context.Background(), "sleep", "10")
 	if err != ErrTimeout {
@@ -73,7 +82,8 @@ func TestExecutorRunCommandTimeout(t *testing.T) {
 }
 
 func TestExecutorRunCommandWithExitCode(t *testing.T) {
-	exec := NewExecutor(5 * time.Second)
+	mysqlCfg, pgCfg := testDatabaseConfig()
+	exec := NewExecutor(5*time.Second, mysqlCfg, pgCfg)
 
 	// Success case
 	output, exitCode, err := exec.RunCommandWithExitCode(context.Background(), "true")
@@ -156,7 +166,8 @@ func TestErrToString(t *testing.T) {
 }
 
 func TestExecutorRegisterHandlers(t *testing.T) {
-	exec := NewExecutor(5 * time.Second)
+	mysqlCfg, pgCfg := testDatabaseConfig()
+	exec := NewExecutor(5*time.Second, mysqlCfg, pgCfg)
 	exec.RegisterHandlers()
 
 	// Check that handlers are registered

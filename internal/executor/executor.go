@@ -18,15 +18,27 @@ var ErrTimeout = errors.New("command timed out")
 
 type JobHandler func(ctx context.Context, payload json.RawMessage) comm.JobResult
 
+// DatabaseConfig holds database connection credentials
+type DatabaseConfig struct {
+	Host     string
+	Port     int
+	User     string
+	Password string
+}
+
 type Executor struct {
 	defaultTimeout time.Duration
 	handlers       map[string]JobHandler
+	mysqlConfig    DatabaseConfig
+	postgresConfig DatabaseConfig
 }
 
-func NewExecutor(timeout time.Duration) *Executor {
+func NewExecutor(timeout time.Duration, mysqlCfg, postgresCfg DatabaseConfig) *Executor {
 	return &Executor{
 		defaultTimeout: timeout,
 		handlers:       make(map[string]JobHandler),
+		mysqlConfig:    mysqlCfg,
+		postgresConfig: postgresCfg,
 	}
 }
 
@@ -128,6 +140,9 @@ func (e *Executor) RegisterHandlers() {
 	e.Register("ssl_issue", e.handleIssueSSL)
 	e.Register("ssl_renew", e.handleRenewSSL)
 	e.Register("ssl_install", e.handleInstallSSL)
+
+	// System maintenance
+	e.Register("fix_permissions", e.handleFixPermissions)
 
 	// Databases
 	e.Register("create_database", e.handleCreateDatabase)

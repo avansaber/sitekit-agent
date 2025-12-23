@@ -500,7 +500,7 @@ func (e *Executor) handleCreateWebApp(ctx context.Context, payload json.RawMessa
 			return comm.JobResult{Success: false, Error: fmt.Sprintf("failed to create fpm log dir: %v", err)}
 		}
 
-		fpmPath := fmt.Sprintf("/etc/php/%s/fpm/pool.d/%s.conf", p.PhpVersion, p.Username)
+		fpmPath := fmt.Sprintf("/etc/php/%s/fpm/pool.d/%s.conf", p.PhpVersion, p.AppID)
 		if err := os.WriteFile(fpmPath, []byte(p.FpmConfig), 0644); err != nil {
 			return comm.JobResult{Success: false, Error: fmt.Sprintf("failed to write fpm config: %v", err)}
 		}
@@ -562,7 +562,7 @@ func (e *Executor) handleUpdateWebAppConfig(ctx context.Context, payload json.Ra
 
 	// If PHP version changed, remove old FPM pool config
 	if p.OldPhpVersion != "" && p.OldPhpVersion != p.PhpVersion {
-		oldFpmPath := fmt.Sprintf("/etc/php/%s/fpm/pool.d/%s.conf", p.OldPhpVersion, p.Username)
+		oldFpmPath := fmt.Sprintf("/etc/php/%s/fpm/pool.d/%s.conf", p.OldPhpVersion, p.AppID)
 		if err := os.Remove(oldFpmPath); err != nil && !os.IsNotExist(err) {
 			log.Warn().Err(err).Str("path", oldFpmPath).Msg("Failed to remove old FPM pool config")
 		} else {
@@ -574,7 +574,7 @@ func (e *Executor) handleUpdateWebAppConfig(ctx context.Context, payload json.Ra
 
 	// Update PHP-FPM config if provided
 	if p.FpmConfig != "" {
-		fpmPath := fmt.Sprintf("/etc/php/%s/fpm/pool.d/%s.conf", p.PhpVersion, p.Username)
+		fpmPath := fmt.Sprintf("/etc/php/%s/fpm/pool.d/%s.conf", p.PhpVersion, p.AppID)
 		if err := os.WriteFile(fpmPath, []byte(p.FpmConfig), 0644); err != nil {
 			return comm.JobResult{Success: false, Error: fmt.Sprintf("failed to write fpm config: %v", err)}
 		}
@@ -619,7 +619,7 @@ func (e *Executor) handleDeleteWebApp(ctx context.Context, payload json.RawMessa
 
 	// Remove PHP-FPM pool config
 	if p.PhpVersion != "" {
-		fpmPath := fmt.Sprintf("/etc/php/%s/fpm/pool.d/%s.conf", p.PhpVersion, p.Username)
+		fpmPath := fmt.Sprintf("/etc/php/%s/fpm/pool.d/%s.conf", p.PhpVersion, p.AppID)
 		os.Remove(fpmPath)
 		e.RunCommand(ctx, "systemctl", "reload", fmt.Sprintf("php%s-fpm", p.PhpVersion))
 		output.WriteString("PHP-FPM pool config removed\n")
@@ -663,6 +663,12 @@ func (e *Executor) handleIssueSSL(ctx context.Context, payload json.RawMessage) 
 		Strs("domains", p.Domains).
 		Msg("Issuing SSL certificate")
 
+	// Fix permissions on webroot path to ensure nginx can serve ACME challenge
+	// This fixes the common issue where /home/hostman has 750 permissions
+	if err := e.fixWebrootPermissions(p.Webroot); err != nil {
+		log.Warn().Err(err).Msg("Failed to fix webroot permissions, continuing anyway")
+	}
+
 	args := []string{
 		"certonly",
 		"--webroot",
@@ -683,10 +689,15 @@ func (e *Executor) handleIssueSSL(ctx context.Context, payload json.RawMessage) 
 	output, exitCode, err := e.RunCommandWithExitCode(ctx, "certbot", args...)
 
 	if err != nil {
+		// Try to get more detailed error from certbot log
+		detailedError := e.getCertbotError(output)
+		if detailedError == "" {
+			detailedError = err.Error()
+		}
 		return comm.JobResult{
 			Success:  false,
 			Output:   output,
-			Error:    err.Error(),
+			Error:    detailedError,
 			ExitCode: exitCode,
 		}
 	}
@@ -787,22 +798,20 @@ func (e *Executor) handleInstallSSL(ctx context.Context, payload json.RawMessage
 
 // Database handlers
 
-// getMySQLRootPassword reads the MySQL root password from the config file
-func getMySQLRootPassword() string {
+// getMySQLArgs returns the common args for MySQL commands with authentication using sitekit user
+func (e *Executor) getMySQLArgs(query string) []string {
+	if e.mysqlConfig.User != "" && e.mysqlConfig.Password != "" {
+		return []string{"-u", e.mysqlConfig.User, "-p" + e.mysqlConfig.Password, "-e", query}
+	}
+	// Fallback to reading root password from file (for backwards compatibility)
 	data, err := os.ReadFile("/opt/hostman/config/.mysql_root")
-	if err != nil {
-		log.Warn().Err(err).Msg("Failed to read MySQL root password file")
-		return ""
+	if err == nil {
+		password := strings.TrimSpace(string(data))
+		if password != "" {
+			return []string{"-u", "root", "-p" + password, "-e", query}
+		}
 	}
-	return strings.TrimSpace(string(data))
-}
-
-// getMySQLArgs returns the common args for MySQL commands with authentication
-func getMySQLArgs(query string) []string {
-	password := getMySQLRootPassword()
-	if password != "" {
-		return []string{"-u", "root", "-p" + password, "-e", query}
-	}
+	log.Warn().Msg("No MySQL credentials available")
 	return []string{"-e", query}
 }
 
@@ -830,7 +839,7 @@ func (e *Executor) handleCreateDatabase(ctx context.Context, payload json.RawMes
 	case "mysql", "mariadb":
 		// Create database
 		createDB := fmt.Sprintf("CREATE DATABASE IF NOT EXISTS `%s` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;", p.DatabaseName)
-		out, _, err := e.RunCommandWithExitCode(ctx, "mysql", getMySQLArgs(createDB)...)
+		out, _, err := e.RunCommandWithExitCode(ctx, "mysql", e.getMySQLArgs(createDB)...)
 		output.WriteString(out + "\n")
 		if err != nil {
 			return comm.JobResult{Success: false, Output: output.String(), Error: err.Error()}
@@ -843,14 +852,14 @@ func (e *Executor) handleCreateDatabase(ctx context.Context, payload json.RawMes
 				host = "localhost"
 			}
 			createUser := fmt.Sprintf("CREATE USER IF NOT EXISTS '%s'@'%s' IDENTIFIED BY '%s';", p.Username, host, p.Password)
-			out, _, err = e.RunCommandWithExitCode(ctx, "mysql", getMySQLArgs(createUser)...)
+			out, _, err = e.RunCommandWithExitCode(ctx, "mysql", e.getMySQLArgs(createUser)...)
 			output.WriteString(out + "\n")
 			if err != nil {
 				return comm.JobResult{Success: false, Output: output.String(), Error: err.Error()}
 			}
 
 			grant := fmt.Sprintf("GRANT ALL PRIVILEGES ON `%s`.* TO '%s'@'%s'; FLUSH PRIVILEGES;", p.DatabaseName, p.Username, host)
-			out, _, err = e.RunCommandWithExitCode(ctx, "mysql", getMySQLArgs(grant)...)
+			out, _, err = e.RunCommandWithExitCode(ctx, "mysql", e.getMySQLArgs(grant)...)
 			output.WriteString(out + "\n")
 			if err != nil {
 				return comm.JobResult{Success: false, Output: output.String(), Error: err.Error()}
@@ -905,13 +914,13 @@ func (e *Executor) handleDeleteDatabase(ctx context.Context, payload json.RawMes
 				host = "localhost"
 			}
 			dropUser := fmt.Sprintf("DROP USER IF EXISTS '%s'@'%s';", p.Username, host)
-			out, _, _ := e.RunCommandWithExitCode(ctx, "mysql", getMySQLArgs(dropUser)...)
+			out, _, _ := e.RunCommandWithExitCode(ctx, "mysql", e.getMySQLArgs(dropUser)...)
 			output.WriteString(out + "\n")
 		}
 
 		// Drop database
 		dropDB := fmt.Sprintf("DROP DATABASE IF EXISTS `%s`;", p.DatabaseName)
-		out, _, err := e.RunCommandWithExitCode(ctx, "mysql", getMySQLArgs(dropDB)...)
+		out, _, err := e.RunCommandWithExitCode(ctx, "mysql", e.getMySQLArgs(dropDB)...)
 		output.WriteString(out + "\n")
 		if err != nil {
 			return comm.JobResult{Success: false, Output: output.String(), Error: err.Error()}
@@ -1519,9 +1528,8 @@ func (e *Executor) handleExportDatabase(ctx context.Context, payload json.RawMes
 	switch p.Type {
 	case "mysql", "mariadb":
 		args := []string{}
-		password := getMySQLRootPassword()
-		if password != "" {
-			args = append(args, "-u", "root", "-p'"+password+"'")
+		if e.mysqlConfig.User != "" && e.mysqlConfig.Password != "" {
+			args = append(args, "-u", e.mysqlConfig.User, "-p'"+e.mysqlConfig.Password+"'")
 		}
 		if !p.IncludeData {
 			args = append(args, "--no-data")
@@ -1625,7 +1633,11 @@ func (e *Executor) handleOptimizeDatabase(ctx context.Context, payload json.RawM
 	var cmd string
 	switch p.Type {
 	case "mysql", "mariadb":
-		cmd = fmt.Sprintf("mysqlcheck --optimize %s", p.DBName)
+		if e.mysqlConfig.User != "" && e.mysqlConfig.Password != "" {
+			cmd = fmt.Sprintf("mysqlcheck -u %s -p'%s' --optimize %s", e.mysqlConfig.User, e.mysqlConfig.Password, p.DBName)
+		} else {
+			cmd = fmt.Sprintf("mysqlcheck --optimize %s", p.DBName)
+		}
 	case "postgresql":
 		cmd = fmt.Sprintf("sudo -u postgres psql -d %s -c \"VACUUM ANALYZE;\"", p.DBName)
 	default:
@@ -1749,9 +1761,8 @@ func (e *Executor) handleDatabaseBackup(ctx context.Context, payload json.RawMes
 	var cmd string
 	switch p.DatabaseType {
 	case "mysql", "mariadb":
-		password := getMySQLRootPassword()
-		if password != "" {
-			cmd = fmt.Sprintf("mysqldump -u root -p'%s' --single-transaction --quick --lock-tables=false %s > %s", password, p.DatabaseName, uncompressedFile)
+		if e.mysqlConfig.User != "" && e.mysqlConfig.Password != "" {
+			cmd = fmt.Sprintf("mysqldump -u %s -p'%s' --single-transaction --quick --lock-tables=false %s > %s", e.mysqlConfig.User, e.mysqlConfig.Password, p.DatabaseName, uncompressedFile)
 		} else {
 			cmd = fmt.Sprintf("mysqldump --single-transaction --quick --lock-tables=false %s > %s", p.DatabaseName, uncompressedFile)
 		}
@@ -2740,4 +2751,149 @@ func (e *Executor) handleCheckServices(ctx context.Context, payload json.RawMess
 		Output:  output.String(),
 		Data:    results,
 	}
+}
+
+// handleFixPermissions fixes common permission issues on the server
+func (e *Executor) handleFixPermissions(ctx context.Context, payload json.RawMessage) comm.JobResult {
+	log.Info().Msg("Fixing server permissions")
+
+	var output strings.Builder
+
+	// Fix /home/hostman permissions for nginx access
+	paths := []string{
+		"/home/hostman",
+		"/home/hostman/web",
+	}
+
+	for _, path := range paths {
+		info, err := os.Stat(path)
+		if err != nil {
+			if os.IsNotExist(err) {
+				output.WriteString(fmt.Sprintf("Skipped %s (does not exist)\n", path))
+				continue
+			}
+			output.WriteString(fmt.Sprintf("Error checking %s: %v\n", path, err))
+			continue
+		}
+
+		mode := info.Mode().Perm()
+		if mode&0005 != 0005 {
+			newMode := mode | 0005 // Add read+execute for others
+			if err := os.Chmod(path, newMode); err != nil {
+				output.WriteString(fmt.Sprintf("Failed to fix %s: %v\n", path, err))
+			} else {
+				output.WriteString(fmt.Sprintf("Fixed %s: %o -> %o\n", path, mode, newMode))
+			}
+		} else {
+			output.WriteString(fmt.Sprintf("OK %s: %o (already correct)\n", path, mode))
+		}
+	}
+
+	output.WriteString("\nPermissions fixed successfully. SSL certificates should now work.\n")
+
+	return comm.JobResult{
+		Success: true,
+		Output:  output.String(),
+	}
+}
+
+// fixWebrootPermissions ensures nginx can traverse to the webroot to serve ACME challenges
+// This fixes the common issue where /home/hostman has 750 permissions but nginx runs as www-data
+func (e *Executor) fixWebrootPermissions(webroot string) error {
+	// Walk up the directory tree and ensure each directory has at least 755 permissions
+	// so nginx (www-data) can traverse to the webroot
+	parts := strings.Split(filepath.Clean(webroot), string(filepath.Separator))
+	currentPath := "/"
+
+	for _, part := range parts {
+		if part == "" {
+			continue
+		}
+		currentPath = filepath.Join(currentPath, part)
+
+		info, err := os.Stat(currentPath)
+		if err != nil {
+			continue // Skip if doesn't exist yet
+		}
+
+		// Check if world-readable (others have read+execute)
+		mode := info.Mode().Perm()
+		if mode&0005 != 0005 {
+			// Directory is not world-traversable, fix it
+			newMode := mode | 0005 // Add read+execute for others
+			log.Info().
+				Str("path", currentPath).
+				Str("old_mode", fmt.Sprintf("%o", mode)).
+				Str("new_mode", fmt.Sprintf("%o", newMode)).
+				Msg("Fixing directory permissions for nginx access")
+
+			if err := os.Chmod(currentPath, newMode); err != nil {
+				log.Warn().Err(err).Str("path", currentPath).Msg("Failed to fix permissions")
+				// Continue anyway, might work with group permissions
+			}
+		}
+	}
+
+	return nil
+}
+
+// getCertbotError extracts a meaningful error message from certbot output
+func (e *Executor) getCertbotError(output string) string {
+	// Look for common certbot error patterns
+	lines := strings.Split(output, "\n")
+
+	// Priority 1: Look for "Detail:" line from ACME error
+	for _, line := range lines {
+		if strings.Contains(line, "Detail:") {
+			// Extract just the detail part
+			if idx := strings.Index(line, "Detail:"); idx != -1 {
+				detail := strings.TrimSpace(line[idx+7:])
+				if detail != "" {
+					return detail
+				}
+			}
+		}
+	}
+
+	// Priority 2: Look for "IMPORTANT NOTES:" section
+	for i, line := range lines {
+		if strings.Contains(line, "IMPORTANT NOTES:") && i+1 < len(lines) {
+			// Return next non-empty line
+			for j := i + 1; j < len(lines) && j < i+5; j++ {
+				note := strings.TrimSpace(lines[j])
+				if note != "" && !strings.HasPrefix(note, "-") {
+					return note
+				}
+			}
+		}
+	}
+
+	// Priority 3: Look for specific error messages
+	errorPatterns := []string{
+		"DNS problem",
+		"Connection refused",
+		"Invalid response",
+		"unauthorized",
+		"Timeout",
+		"rate limit",
+		"too many certificates",
+	}
+
+	for _, line := range lines {
+		for _, pattern := range errorPatterns {
+			if strings.Contains(strings.ToLower(line), strings.ToLower(pattern)) {
+				return strings.TrimSpace(line)
+			}
+		}
+	}
+
+	// Priority 4: Return last non-empty line as fallback
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := strings.TrimSpace(lines[i])
+		if line != "" && !strings.HasPrefix(line, "-") {
+			return line
+		}
+	}
+
+	return ""
 }

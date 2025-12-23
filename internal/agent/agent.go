@@ -19,10 +19,24 @@ type Agent struct {
 }
 
 func New(cfg *Config) *Agent {
+	// Convert config database settings to executor DatabaseConfig
+	mysqlCfg := executor.DatabaseConfig{
+		Host:     cfg.MySQL.Host,
+		Port:     cfg.MySQL.Port,
+		User:     cfg.MySQL.User,
+		Password: cfg.MySQL.Password,
+	}
+	postgresCfg := executor.DatabaseConfig{
+		Host:     cfg.PostgreSQL.Host,
+		Port:     cfg.PostgreSQL.Port,
+		User:     cfg.PostgreSQL.User,
+		Password: cfg.PostgreSQL.Password,
+	}
+
 	return &Agent{
 		cfg:      cfg,
 		client:   comm.NewClient(cfg.SaasURL, cfg.AgentToken),
-		executor: executor.NewExecutor(5 * time.Minute),
+		executor: executor.NewExecutor(5*time.Minute, mysqlCfg, postgresCfg),
 	}
 }
 
