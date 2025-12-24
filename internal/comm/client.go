@@ -119,7 +119,7 @@ func (c *Client) ReportJobComplete(ctx context.Context, jobID string, result Job
 	return nil
 }
 
-func (c *Client) SendHeartbeat(ctx context.Context, stats *health.SystemStats, services []health.ServiceStatus) error {
+func (c *Client) SendHeartbeat(ctx context.Context, stats *health.SystemStats, services []health.ServiceStatus, daemons []health.DaemonStatus) error {
 	payload := map[string]interface{}{
 		"cpu_percent":     stats.CPUPercent,
 		"memory_percent":  stats.MemoryPercent,
@@ -133,6 +133,7 @@ func (c *Client) SendHeartbeat(ctx context.Context, stats *health.SystemStats, s
 		"memory_mb":       stats.MemoryTotalMB,
 		"disk_gb":         stats.DiskTotalGB,
 		"services_status": services,
+		"daemons_status":  daemons,
 	}
 
 	resp, err := c.doRequest(ctx, http.MethodPost, "/api/agent/heartbeat", payload)

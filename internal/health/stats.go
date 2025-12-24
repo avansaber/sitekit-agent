@@ -1,6 +1,7 @@
 package health
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"runtime"
@@ -33,6 +34,15 @@ type ServiceStatus struct {
 	Name          string  `json:"name"`
 	Status        string  `json:"status"` // running, stopped, failed, not-installed
 	Enabled       bool    `json:"enabled"`
+	CPUPercent    float64 `json:"cpu_percent,omitempty"`
+	MemoryMB      uint64  `json:"memory_mb,omitempty"`
+	UptimeSeconds uint64  `json:"uptime_seconds,omitempty"`
+}
+
+type DaemonStatus struct {
+	Name          string  `json:"name"`
+	Status        string  `json:"status"` // RUNNING, STOPPED, STARTING, BACKOFF, STOPPING, EXITED, FATAL, UNKNOWN
+	PID           int     `json:"pid,omitempty"`
 	CPUPercent    float64 `json:"cpu_percent,omitempty"`
 	MemoryMB      uint64  `json:"memory_mb,omitempty"`
 	UptimeSeconds uint64  `json:"uptime_seconds,omitempty"`
@@ -279,3 +289,130 @@ func GetMachineID() string {
 	hostname, _ := os.Hostname()
 	return hostname
 }
+
+// CollectDaemonStatuses collects status for all supervisor-managed programs
+func CollectDaemonStatuses() []DaemonStatus {
+	var daemons []DaemonStatus
+
+	// Run supervisorctl status to get all programs
+	cmd := exec.Command("supervisorctl", "status")
+	output, err := cmd.Output()
+	if err != nil {
+		// Supervisor might not be running or installed
+		return daemons
+	}
+
+	// Parse output lines
+	// Format: program_name                    STATUS     pid PID, uptime H:MM:SS
+	// Example: laravel-worker:laravel-worker_00   RUNNING    pid 12345, uptime 1:23:45
+	lines := strings.Split(string(output), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+
+		daemon := parseSupervisorStatusLine(line)
+		if daemon.Name != "" {
+			// Collect metrics for running daemons
+			if daemon.Status == "RUNNING" && daemon.PID > 0 {
+				collectDaemonMetrics(&daemon)
+			}
+			daemons = append(daemons, daemon)
+		}
+	}
+
+	return daemons
+}
+
+func parseSupervisorStatusLine(line string) DaemonStatus {
+	daemon := DaemonStatus{}
+
+	// Split by whitespace
+	fields := strings.Fields(line)
+	if len(fields) < 2 {
+		return daemon
+	}
+
+	daemon.Name = fields[0]
+	daemon.Status = fields[1]
+
+	// Parse PID if present (format: "pid 12345,")
+	for i, field := range fields {
+		if field == "pid" && i+1 < len(fields) {
+			pidStr := strings.TrimSuffix(fields[i+1], ",")
+			daemon.PID = int(parseUint64(pidStr))
+		}
+		if field == "uptime" && i+1 < len(fields) {
+			daemon.UptimeSeconds = parseUptimeString(fields[i+1])
+		}
+	}
+
+	return daemon
+}
+
+func parseUptimeString(uptime string) uint64 {
+	// Format: H:MM:SS or D days, H:MM:SS
+	var total uint64
+
+	// Check for days
+	if strings.Contains(uptime, "days,") {
+		parts := strings.SplitN(uptime, "days,", 2)
+		days := parseUint64(strings.TrimSpace(parts[0]))
+		total += days * 24 * 3600
+		if len(parts) > 1 {
+			uptime = strings.TrimSpace(parts[1])
+		}
+	} else if strings.Contains(uptime, "day,") {
+		parts := strings.SplitN(uptime, "day,", 2)
+		days := parseUint64(strings.TrimSpace(parts[0]))
+		total += days * 24 * 3600
+		if len(parts) > 1 {
+			uptime = strings.TrimSpace(parts[1])
+		}
+	}
+
+	// Parse H:MM:SS
+	timeParts := strings.Split(uptime, ":")
+	if len(timeParts) == 3 {
+		hours := parseUint64(timeParts[0])
+		mins := parseUint64(timeParts[1])
+		secs := parseUint64(timeParts[2])
+		total += hours*3600 + mins*60 + secs
+	}
+
+	return total
+}
+
+func collectDaemonMetrics(daemon *DaemonStatus) {
+	if daemon.PID <= 0 {
+		return
+	}
+
+	pidStr := fmt.Sprintf("%d", daemon.PID)
+
+	// Get CPU percentage
+	if cpu := getProcessCPU(pidStr); cpu >= 0 {
+		daemon.CPUPercent = cpu
+	}
+
+	// Get memory usage from /proc/PID/status
+	statusPath := fmt.Sprintf("/proc/%d/status", daemon.PID)
+	data, err := os.ReadFile(statusPath)
+	if err != nil {
+		return
+	}
+
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(line, "VmRSS:") {
+			// Format: VmRSS:     12345 kB
+			fields := strings.Fields(line)
+			if len(fields) >= 2 {
+				kbytes := parseUint64(fields[1])
+				daemon.MemoryMB = kbytes / 1024
+			}
+			break
+		}
+	}
+}
+

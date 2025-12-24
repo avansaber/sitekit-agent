@@ -148,14 +148,16 @@ func (a *Agent) sendHeartbeat(ctx context.Context) {
 	}
 
 	services := health.CollectServiceStatuses()
+	daemons := health.CollectDaemonStatuses()
 
-	if err := a.client.SendHeartbeat(ctx, stats, services); err != nil {
+	if err := a.client.SendHeartbeat(ctx, stats, services, daemons); err != nil {
 		log.Error().Err(err).Msg("Failed to send heartbeat")
 	} else {
 		log.Debug().
 			Float64("cpu", stats.CPUPercent).
 			Float64("mem", stats.MemoryPercent).
 			Int("services", len(services)).
+			Int("daemons", len(daemons)).
 			Msg("Heartbeat sent")
 	}
 }
