@@ -160,6 +160,72 @@ func (e *Executor) handleServiceUninstall(ctx context.Context, payload json.RawM
 	}
 }
 
+// PHP Extension handlers
+
+func (e *Executor) handlePhpInstallExtension(ctx context.Context, payload json.RawMessage) comm.JobResult {
+	var p struct {
+		ServiceID string `json:"service_id"`
+		Version   string `json:"version"`
+		Extension string `json:"extension"`
+		Package   string `json:"package"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+
+	// Install the PHP extension package
+	output, exitCode, err := e.RunCommandWithExitCode(ctx,
+		"apt-get", "install", "-y", p.Package)
+	if err != nil {
+		return comm.JobResult{Success: false, Output: output, Error: err.Error(), ExitCode: exitCode}
+	}
+
+	// Restart PHP-FPM to load the extension
+	fpmService := fmt.Sprintf("php%s-fpm", p.Version)
+	restartOutput, _, _ := e.RunCommandWithExitCode(ctx, "systemctl", "restart", fpmService)
+
+	return comm.JobResult{
+		Success: true,
+		Output:  fmt.Sprintf("Installed %s\n%s\nRestarted %s:\n%s", p.Package, output, fpmService, restartOutput),
+	}
+}
+
+func (e *Executor) handlePhpUninstallExtension(ctx context.Context, payload json.RawMessage) comm.JobResult {
+	var p struct {
+		ServiceID string `json:"service_id"`
+		Version   string `json:"version"`
+		Extension string `json:"extension"`
+		Package   string `json:"package"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+
+	// Prevent removing core extensions
+	coreExtensions := []string{"cli", "fpm", "common"}
+	for _, core := range coreExtensions {
+		if p.Extension == core {
+			return comm.JobResult{Success: false, Error: fmt.Sprintf("Cannot uninstall core extension: %s", core)}
+		}
+	}
+
+	// Remove the PHP extension package
+	output, exitCode, err := e.RunCommandWithExitCode(ctx,
+		"apt-get", "remove", "-y", p.Package)
+	if err != nil {
+		return comm.JobResult{Success: false, Output: output, Error: err.Error(), ExitCode: exitCode}
+	}
+
+	// Restart PHP-FPM to unload the extension
+	fpmService := fmt.Sprintf("php%s-fpm", p.Version)
+	restartOutput, _, _ := e.RunCommandWithExitCode(ctx, "systemctl", "restart", fpmService)
+
+	return comm.JobResult{
+		Success: true,
+		Output:  fmt.Sprintf("Removed %s\n%s\nRestarted %s:\n%s", p.Package, output, fpmService, restartOutput),
+	}
+}
+
 // User handlers
 
 func (e *Executor) handleCreateUser(ctx context.Context, payload json.RawMessage) comm.JobResult {

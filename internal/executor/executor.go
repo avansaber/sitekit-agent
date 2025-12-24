@@ -115,6 +115,10 @@ func (e *Executor) RegisterHandlers() {
 	e.Register("service_install", e.handleServiceInstall)
 	e.Register("service_uninstall", e.handleServiceUninstall)
 
+	// PHP extension management
+	e.Register("php_install_extension", e.handlePhpInstallExtension)
+	e.Register("php_uninstall_extension", e.handlePhpUninstallExtension)
+
 	// User management
 	e.Register("create_user", e.handleCreateUser)
 	e.Register("delete_user", e.handleDeleteUser)
