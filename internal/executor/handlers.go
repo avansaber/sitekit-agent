@@ -226,6 +226,45 @@ func (e *Executor) handlePhpUninstallExtension(ctx context.Context, payload json
 	}
 }
 
+// Config validation handlers
+
+func (e *Executor) handleValidateNginxConfig(ctx context.Context, payload json.RawMessage) comm.JobResult {
+	// nginx -t tests the configuration syntax
+	output, exitCode, err := e.RunCommandWithExitCode(ctx, "nginx", "-t")
+
+	return comm.JobResult{
+		Success:  err == nil && exitCode == 0,
+		Output:   output,
+		Error:    errToString(err),
+		ExitCode: exitCode,
+	}
+}
+
+func (e *Executor) handleValidatePhpConfig(ctx context.Context, payload json.RawMessage) comm.JobResult {
+	var p struct {
+		Version string `json:"version"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+
+	version := p.Version
+	if version == "" {
+		version = "8.3" // Default to 8.3
+	}
+
+	// php-fpmX.Y -t tests the PHP-FPM configuration
+	fpmBin := fmt.Sprintf("php-fpm%s", version)
+	output, exitCode, err := e.RunCommandWithExitCode(ctx, fpmBin, "-t")
+
+	return comm.JobResult{
+		Success:  err == nil && exitCode == 0,
+		Output:   output,
+		Error:    errToString(err),
+		ExitCode: exitCode,
+	}
+}
+
 // User handlers
 
 func (e *Executor) handleCreateUser(ctx context.Context, payload json.RawMessage) comm.JobResult {

@@ -30,9 +30,12 @@ type SystemStats struct {
 }
 
 type ServiceStatus struct {
-	Name    string `json:"name"`
-	Status  string `json:"status"` // running, stopped, failed, not-installed
-	Enabled bool   `json:"enabled"`
+	Name          string  `json:"name"`
+	Status        string  `json:"status"` // running, stopped, failed, not-installed
+	Enabled       bool    `json:"enabled"`
+	CPUPercent    float64 `json:"cpu_percent,omitempty"`
+	MemoryMB      uint64  `json:"memory_mb,omitempty"`
+	UptimeSeconds uint64  `json:"uptime_seconds,omitempty"`
 }
 
 func CollectStats() (*SystemStats, error) {
@@ -137,7 +140,133 @@ func checkServiceStatus(serviceName string) ServiceStatus {
 	enabledOutput, _ := enabledCmd.Output()
 	status.Enabled = strings.TrimSpace(string(enabledOutput)) == "enabled"
 
+	// Collect metrics for running services
+	if status.Status == "running" {
+		collectServiceMetrics(&status, serviceName)
+	}
+
 	return status
+}
+
+// collectServiceMetrics collects CPU, memory, and uptime for a running service
+func collectServiceMetrics(status *ServiceStatus, serviceName string) {
+	// Get MainPID and uptime using systemctl show
+	showCmd := exec.Command("systemctl", "show", serviceName, "--property=MainPID,ActiveEnterTimestamp,MemoryCurrent,CPUUsageNSec")
+	showOutput, err := showCmd.Output()
+	if err != nil {
+		return
+	}
+
+	props := parseSystemctlShow(string(showOutput))
+
+	// Parse MainPID
+	pid := props["MainPID"]
+	if pid == "" || pid == "0" {
+		return
+	}
+
+	// Calculate uptime from ActiveEnterTimestamp
+	if ts := props["ActiveEnterTimestamp"]; ts != "" {
+		status.UptimeSeconds = parseUptimeFromTimestamp(ts)
+	}
+
+	// Memory (MemoryCurrent is in bytes, may not be available on all systems)
+	if mem := props["MemoryCurrent"]; mem != "" && mem != "[not set]" {
+		if memBytes := parseUint64(mem); memBytes > 0 {
+			status.MemoryMB = memBytes / 1024 / 1024
+		}
+	}
+
+	// CPU usage (this is cumulative, not percentage - we'll use it as a rough indicator)
+	// For accurate percentage, we'd need to sample over time
+	// For now, we'll get per-process CPU from /proc
+	if cpuPercent := getProcessCPU(pid); cpuPercent >= 0 {
+		status.CPUPercent = cpuPercent
+	}
+}
+
+func parseSystemctlShow(output string) map[string]string {
+	result := make(map[string]string)
+	for _, line := range strings.Split(output, "\n") {
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) == 2 {
+			result[parts[0]] = parts[1]
+		}
+	}
+	return result
+}
+
+func parseUptimeFromTimestamp(ts string) uint64 {
+	// Format: "Mon 2024-01-15 10:30:45 UTC"
+	// We need to parse this and calculate seconds since then
+	cmd := exec.Command("date", "-d", ts, "+%s")
+	output, err := cmd.Output()
+	if err != nil {
+		return 0
+	}
+	startTime := parseUint64(strings.TrimSpace(string(output)))
+
+	nowCmd := exec.Command("date", "+%s")
+	nowOutput, err := nowCmd.Output()
+	if err != nil {
+		return 0
+	}
+	nowTime := parseUint64(strings.TrimSpace(string(nowOutput)))
+
+	if nowTime > startTime {
+		return nowTime - startTime
+	}
+	return 0
+}
+
+func parseUint64(s string) uint64 {
+	var val uint64
+	for _, c := range s {
+		if c >= '0' && c <= '9' {
+			val = val*10 + uint64(c-'0')
+		} else {
+			break
+		}
+	}
+	return val
+}
+
+func getProcessCPU(pid string) float64 {
+	// Use ps to get CPU percentage
+	cmd := exec.Command("ps", "-p", pid, "-o", "%cpu", "--no-headers")
+	output, err := cmd.Output()
+	if err != nil {
+		return -1
+	}
+
+	cpuStr := strings.TrimSpace(string(output))
+	if cpuStr == "" {
+		return 0
+	}
+
+	// Parse float
+	var cpu float64
+	for i, c := range cpuStr {
+		if c == '.' {
+			// Parse decimal part
+			var decimal float64
+			var factor float64 = 0.1
+			for _, d := range cpuStr[i+1:] {
+				if d >= '0' && d <= '9' {
+					decimal += float64(d-'0') * factor
+					factor /= 10
+				} else {
+					break
+				}
+			}
+			cpu += decimal
+			break
+		} else if c >= '0' && c <= '9' {
+			cpu = cpu*10 + float64(c-'0')
+		}
+	}
+
+	return cpu
 }
 
 func GetMachineID() string {
