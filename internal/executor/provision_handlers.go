@@ -157,6 +157,55 @@ client_max_body_size 64M;
 	return comm.JobResult{Success: true, Output: output.String()}
 }
 
+// handleProvisionApache installs and configures Apache
+func (e *Executor) handleProvisionApache(ctx context.Context, payload json.RawMessage) comm.JobResult {
+	var p struct {
+		StepID int64 `json:"step_id"`
+	}
+	json.Unmarshal(payload, &p)
+
+	log.Info().Int64("step_id", p.StepID).Msg("Provisioning Apache")
+	var output strings.Builder
+
+	// Check if already installed
+	if _, err := os.Stat("/usr/sbin/apache2"); err == nil {
+		output.WriteString("Apache is already installed\n")
+		// Apache is disabled by default - user must start manually
+		e.RunCommandWithExitCode(ctx, "systemctl", "disable", "apache2")
+		return comm.JobResult{Success: true, Output: output.String()}
+	}
+
+	output.WriteString("=== Installing Apache ===\n")
+	installOut, _, installErr := e.RunCommandWithExitCode(ctx, "apt-get", "install", "-y", "-qq", "apache2", "libapache2-mod-fcgid")
+	output.WriteString(installOut)
+	if installErr != nil {
+		return comm.JobResult{Success: false, Output: output.String(), Error: "Failed to install Apache: " + installErr.Error()}
+	}
+
+	// Enable required modules
+	e.RunCommandWithExitCode(ctx, "a2enmod", "rewrite")
+	e.RunCommandWithExitCode(ctx, "a2enmod", "ssl")
+	e.RunCommandWithExitCode(ctx, "a2enmod", "headers")
+	e.RunCommandWithExitCode(ctx, "a2enmod", "proxy")
+	e.RunCommandWithExitCode(ctx, "a2enmod", "proxy_fcgi")
+	e.RunCommandWithExitCode(ctx, "a2enmod", "fcgid")
+
+	// Create sites directories
+	os.MkdirAll("/etc/apache2/sites-available", 0755)
+	os.MkdirAll("/etc/apache2/sites-enabled", 0755)
+
+	// Remove default site
+	os.Remove("/etc/apache2/sites-enabled/000-default.conf")
+
+	// Apache is disabled by default - user must start manually
+	// This prevents port conflicts with Nginx
+	e.RunCommandWithExitCode(ctx, "systemctl", "stop", "apache2")
+	e.RunCommandWithExitCode(ctx, "systemctl", "disable", "apache2")
+
+	output.WriteString("Apache installed (disabled by default - start manually when needed)\n")
+	return comm.JobResult{Success: true, Output: output.String()}
+}
+
 // handleProvisionPHP installs a specific PHP version
 func (e *Executor) handleProvisionPHP(ctx context.Context, payload json.RawMessage) comm.JobResult {
 	var p struct {
@@ -234,23 +283,67 @@ func (e *Executor) handleProvisionPHP(ctx context.Context, payload json.RawMessa
 // handleProvisionMariaDB installs and configures MariaDB
 func (e *Executor) handleProvisionMariaDB(ctx context.Context, payload json.RawMessage) comm.JobResult {
 	var p struct {
-		StepID  int64  `json:"step_id"`
-		Version string `json:"version"`
+		StepID        int64  `json:"step_id"`
+		Version       string `json:"version"`
+		StartsDisabled bool  `json:"starts_disabled"`
 	}
 	json.Unmarshal(payload, &p)
 
-	log.Info().Int64("step_id", p.StepID).Msg("Provisioning MariaDB")
+	if p.Version == "" {
+		p.Version = "11.4" // Default LTS version
+	}
+
+	log.Info().Int64("step_id", p.StepID).Str("version", p.Version).Msg("Provisioning MariaDB")
 	var output strings.Builder
 
-	// Check if already installed
-	if _, err := os.Stat("/usr/bin/mysql"); err == nil {
+	// Check if MariaDB is already installed (check for mariadb binary specifically)
+	mariadbInstalled := false
+	if _, err := os.Stat("/usr/bin/mariadb"); err == nil {
+		mariadbInstalled = true
+	} else if _, err := os.Stat("/usr/bin/mysql"); err == nil {
+		// Check if the mysql binary is actually MariaDB
+		versionOut, _, _ := e.RunCommandWithExitCode(ctx, "mysql", "--version")
+		if strings.Contains(strings.ToLower(versionOut), "mariadb") {
+			mariadbInstalled = true
+		}
+	}
+
+	if mariadbInstalled {
 		output.WriteString("MariaDB is already installed\n")
+		// Stop MySQL if it's running (to avoid port conflict)
+		if e.isServiceActive(ctx, "mysql") {
+			output.WriteString("Stopping MySQL to start MariaDB\n")
+			e.RunCommandWithExitCode(ctx, "systemctl", "stop", "mysql")
+			e.RunCommandWithExitCode(ctx, "systemctl", "disable", "mysql")
+		}
 		e.RunCommandWithExitCode(ctx, "systemctl", "enable", "mariadb")
 		e.RunCommandWithExitCode(ctx, "systemctl", "start", "mariadb")
 		return comm.JobResult{Success: true, Output: output.String()}
 	}
 
-	output.WriteString("=== Installing MariaDB ===\n")
+	// Stop MySQL if it's running before installing MariaDB
+	if e.isServiceActive(ctx, "mysql") {
+		output.WriteString("Stopping MySQL before installing MariaDB\n")
+		e.RunCommandWithExitCode(ctx, "systemctl", "stop", "mysql")
+		e.RunCommandWithExitCode(ctx, "systemctl", "disable", "mysql")
+	}
+
+	output.WriteString("=== Adding MariaDB official repository ===\n")
+	// Add MariaDB official repository for latest versions
+	e.RunCommandWithExitCode(ctx, "apt-get", "install", "-y", "-qq", "curl", "gnupg")
+
+	// Add MariaDB signing key
+	e.RunCommandWithExitCode(ctx, "bash", "-c", "curl -fsSL https://mariadb.org/mariadb_release_signing_key.asc | gpg --dearmor -o /usr/share/keyrings/mariadb-keyring.gpg")
+
+	// Add MariaDB repository
+	osCodename, _, _ := e.RunCommandWithExitCode(ctx, "bash", "-c", "lsb_release -cs")
+	osCodename = strings.TrimSpace(osCodename)
+	repoLine := fmt.Sprintf("deb [signed-by=/usr/share/keyrings/mariadb-keyring.gpg] https://dlm.mariadb.com/repo/mariadb-server/%s/repo/ubuntu %s main", p.Version, osCodename)
+	os.WriteFile("/etc/apt/sources.list.d/mariadb.list", []byte(repoLine+"\n"), 0644)
+
+	e.RunCommandWithExitCode(ctx, "apt-get", "update", "-qq")
+
+	output.WriteString(fmt.Sprintf("=== Installing MariaDB %s ===\n", p.Version))
 	installOut, _, installErr := e.RunCommandWithExitCode(ctx, "apt-get", "install", "-y", "-qq", "mariadb-server", "mariadb-client")
 	output.WriteString(installOut)
 	if installErr != nil {
@@ -300,6 +393,145 @@ func (e *Executor) handleProvisionMariaDB(ctx context.Context, payload json.RawM
 	return comm.JobResult{Success: true, Output: output.String()}
 }
 
+// handleProvisionMySQL installs and configures MySQL
+// If MariaDB is running, MySQL is installed but kept stopped (user can switch via UI)
+func (e *Executor) handleProvisionMySQL(ctx context.Context, payload json.RawMessage) comm.JobResult {
+	var p struct {
+		StepID         int64  `json:"step_id"`
+		Version        string `json:"version"`
+		StartsDisabled bool   `json:"starts_disabled"`
+	}
+	json.Unmarshal(payload, &p)
+
+	if p.Version == "" {
+		p.Version = "8.4" // Default to LTS
+	}
+
+	log.Info().Int64("step_id", p.StepID).Str("version", p.Version).Msg("Provisioning MySQL")
+	var output strings.Builder
+
+	// Check if MySQL is already installed
+	mysqlInstalled := false
+	if _, err := os.Stat("/usr/bin/mysql"); err == nil {
+		versionOut, _, _ := e.RunCommandWithExitCode(ctx, "mysql", "--version")
+		if !strings.Contains(strings.ToLower(versionOut), "mariadb") {
+			mysqlInstalled = true
+		}
+	}
+
+	// Check if MariaDB is currently active
+	mariadbActive := e.isServiceActive(ctx, "mariadb")
+
+	if mysqlInstalled {
+		output.WriteString("MySQL is already installed\n")
+		if mariadbActive || p.StartsDisabled {
+			// MariaDB is running or we're asked to keep MySQL disabled
+			output.WriteString("MariaDB is active - keeping MySQL stopped\n")
+			e.RunCommandWithExitCode(ctx, "systemctl", "stop", "mysql")
+			e.RunCommandWithExitCode(ctx, "systemctl", "disable", "mysql")
+			output.WriteString("MySQL installed but disabled (activate via SiteKit UI)\n")
+		} else {
+			e.RunCommandWithExitCode(ctx, "systemctl", "enable", "mysql")
+			e.RunCommandWithExitCode(ctx, "systemctl", "start", "mysql")
+		}
+		return comm.JobResult{Success: true, Output: output.String()}
+	}
+
+	output.WriteString("=== Installing MySQL ===\n")
+
+	// Add MySQL APT repository for latest version
+	e.RunCommandWithExitCode(ctx, "apt-get", "install", "-y", "-qq", "gnupg", "wget")
+
+	// Download and add MySQL APT config (latest version)
+	e.RunCommandWithExitCode(ctx, "bash", "-c", "wget -q https://dev.mysql.com/get/mysql-apt-config_0.8.30-1_all.deb -O /tmp/mysql-apt-config.deb")
+	e.RunCommandWithExitCode(ctx, "bash", "-c", "DEBIAN_FRONTEND=noninteractive dpkg -i /tmp/mysql-apt-config.deb")
+	e.RunCommandWithExitCode(ctx, "apt-get", "update", "-qq")
+
+	// Install MySQL server
+	installOut, _, installErr := e.RunCommandWithExitCode(ctx, "bash", "-c", "DEBIAN_FRONTEND=noninteractive apt-get install -y -qq mysql-server")
+	output.WriteString(installOut)
+	if installErr != nil {
+		return comm.JobResult{Success: false, Output: output.String(), Error: "Failed to install MySQL: " + installErr.Error()}
+	}
+
+	// Decide whether to start MySQL based on MariaDB status
+	if mariadbActive || p.StartsDisabled {
+		// MariaDB is running - keep MySQL stopped to avoid port conflict
+		output.WriteString("MariaDB is active - keeping MySQL stopped\n")
+		e.RunCommandWithExitCode(ctx, "systemctl", "stop", "mysql")
+		e.RunCommandWithExitCode(ctx, "systemctl", "disable", "mysql")
+	} else {
+		// No MariaDB running - MySQL can be active
+		e.RunCommandWithExitCode(ctx, "systemctl", "enable", "mysql")
+		e.RunCommandWithExitCode(ctx, "systemctl", "start", "mysql")
+	}
+
+	// Check if credentials already exist
+	configDir := "/opt/sitekit/config"
+	os.MkdirAll(configDir, 0755)
+
+	// For credential setup, we need MySQL running temporarily
+	needsCredentialSetup := false
+	if _, err := os.Stat(configDir + "/.mysql8_root"); os.IsNotExist(err) {
+		needsCredentialSetup = true
+	}
+
+	if needsCredentialSetup {
+		// Temporarily start MySQL for credential setup if it's not running
+		wasRunning := e.isServiceActive(ctx, "mysql")
+		if !wasRunning {
+			// Stop MariaDB temporarily if needed
+			if mariadbActive {
+				e.RunCommandWithExitCode(ctx, "systemctl", "stop", "mariadb")
+			}
+			e.RunCommandWithExitCode(ctx, "systemctl", "start", "mysql")
+		}
+
+		// Generate and set root password
+		rootPass, _, _ := e.RunCommandWithExitCode(ctx, "openssl", "rand", "-base64", "24")
+		rootPass = strings.TrimSpace(rootPass)
+
+		// Secure the installation
+		e.RunCommandWithExitCode(ctx, "mysql", "-e", fmt.Sprintf("ALTER USER 'root'@'localhost' IDENTIFIED WITH caching_sha2_password BY '%s';", rootPass))
+		e.RunCommandWithExitCode(ctx, "mysql", "-u", "root", "-p"+rootPass, "-e", "DELETE FROM mysql.user WHERE User='';")
+		e.RunCommandWithExitCode(ctx, "mysql", "-u", "root", "-p"+rootPass, "-e", "DROP DATABASE IF EXISTS test;")
+		e.RunCommandWithExitCode(ctx, "mysql", "-u", "root", "-p"+rootPass, "-e", "FLUSH PRIVILEGES;")
+
+		// Store MySQL 8.x credentials separately from MariaDB
+		os.WriteFile(configDir+"/.mysql8_root", []byte(rootPass), 0600)
+
+		// Create sitekit system user
+		sitekitPass, _, _ := e.RunCommandWithExitCode(ctx, "openssl", "rand", "-base64", "24")
+		sitekitPass = strings.TrimSpace(sitekitPass)
+
+		e.RunCommandWithExitCode(ctx, "mysql", "-u", "root", "-p"+rootPass, "-e",
+			fmt.Sprintf("CREATE USER IF NOT EXISTS 'sitekit'@'localhost' IDENTIFIED WITH caching_sha2_password BY '%s';", sitekitPass))
+		e.RunCommandWithExitCode(ctx, "mysql", "-u", "root", "-p"+rootPass, "-e",
+			"GRANT ALL PRIVILEGES ON *.* TO 'sitekit'@'localhost' WITH GRANT OPTION;")
+		e.RunCommandWithExitCode(ctx, "mysql", "-u", "root", "-p"+rootPass, "-e", "FLUSH PRIVILEGES;")
+
+		os.WriteFile(configDir+"/.mysql8_sitekit", []byte(sitekitPass), 0600)
+
+		// Restore original state
+		if !wasRunning {
+			e.RunCommandWithExitCode(ctx, "systemctl", "stop", "mysql")
+			e.RunCommandWithExitCode(ctx, "systemctl", "disable", "mysql")
+			if mariadbActive {
+				e.RunCommandWithExitCode(ctx, "systemctl", "start", "mariadb")
+			}
+		}
+	} else {
+		output.WriteString("MySQL credentials already configured\n")
+	}
+
+	if mariadbActive || p.StartsDisabled {
+		output.WriteString("MySQL installed but disabled (MariaDB is default - switch via SiteKit UI)\n")
+	} else {
+		output.WriteString("MySQL installed and secured\n")
+	}
+	return comm.JobResult{Success: true, Output: output.String()}
+}
+
 // handleProvisionPostgreSQL installs and configures PostgreSQL
 func (e *Executor) handleProvisionPostgreSQL(ctx context.Context, payload json.RawMessage) comm.JobResult {
 	var p struct {
@@ -308,7 +540,11 @@ func (e *Executor) handleProvisionPostgreSQL(ctx context.Context, payload json.R
 	}
 	json.Unmarshal(payload, &p)
 
-	log.Info().Int64("step_id", p.StepID).Msg("Provisioning PostgreSQL")
+	if p.Version == "" {
+		p.Version = "17" // Latest stable
+	}
+
+	log.Info().Int64("step_id", p.StepID).Str("version", p.Version).Msg("Provisioning PostgreSQL")
 	var output strings.Builder
 
 	// Check if already installed
@@ -319,8 +555,23 @@ func (e *Executor) handleProvisionPostgreSQL(ctx context.Context, payload json.R
 		return comm.JobResult{Success: true, Output: output.String()}
 	}
 
-	output.WriteString("=== Installing PostgreSQL ===\n")
-	installOut, _, installErr := e.RunCommandWithExitCode(ctx, "apt-get", "install", "-y", "-qq", "postgresql", "postgresql-contrib")
+	output.WriteString("=== Adding PostgreSQL official repository ===\n")
+	// Add PostgreSQL Global Development Group (PGDG) repository
+	e.RunCommandWithExitCode(ctx, "apt-get", "install", "-y", "-qq", "curl", "gnupg", "lsb-release")
+
+	// Add PostgreSQL signing key
+	e.RunCommandWithExitCode(ctx, "bash", "-c", "curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | gpg --dearmor -o /usr/share/keyrings/postgresql-keyring.gpg")
+
+	// Add PostgreSQL repository
+	osCodename, _, _ := e.RunCommandWithExitCode(ctx, "bash", "-c", "lsb_release -cs")
+	osCodename = strings.TrimSpace(osCodename)
+	repoLine := fmt.Sprintf("deb [signed-by=/usr/share/keyrings/postgresql-keyring.gpg] https://apt.postgresql.org/pub/repos/apt %s-pgdg main", osCodename)
+	os.WriteFile("/etc/apt/sources.list.d/pgdg.list", []byte(repoLine+"\n"), 0644)
+
+	e.RunCommandWithExitCode(ctx, "apt-get", "update", "-qq")
+
+	output.WriteString(fmt.Sprintf("=== Installing PostgreSQL %s ===\n", p.Version))
+	installOut, _, installErr := e.RunCommandWithExitCode(ctx, "apt-get", "install", "-y", "-qq", fmt.Sprintf("postgresql-%s", p.Version), "postgresql-contrib")
 	output.WriteString(installOut)
 	if installErr != nil {
 		return comm.JobResult{Success: false, Output: output.String(), Error: "Failed to install PostgreSQL: " + installErr.Error()}
@@ -456,7 +707,7 @@ func (e *Executor) handleProvisionNode(ctx context.Context, payload json.RawMess
 	}
 
 	if p.Version == "" {
-		p.Version = "20"
+		p.Version = "24" // Active LTS
 	}
 
 	log.Info().Int64("step_id", p.StepID).Str("version", p.Version).Msg("Provisioning Node.js")
@@ -567,4 +818,16 @@ postgresql:
 		config += pgConfig
 		os.WriteFile(configPath, []byte(config), 0600)
 	}
+}
+
+// isServiceActive checks if a systemd service is currently running
+func (e *Executor) isServiceActive(ctx context.Context, serviceName string) bool {
+	out, _, _ := e.RunCommandWithExitCode(ctx, "systemctl", "is-active", serviceName)
+	return strings.TrimSpace(out) == "active"
+}
+
+// isServiceInstalled checks if a systemd service unit exists
+func (e *Executor) isServiceInstalled(ctx context.Context, serviceName string) bool {
+	_, exitCode, _ := e.RunCommandWithExitCode(ctx, "systemctl", "list-unit-files", serviceName+".service")
+	return exitCode == 0
 }

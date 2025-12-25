@@ -32,7 +32,8 @@ type SystemStats struct {
 
 type ServiceStatus struct {
 	Name          string  `json:"name"`
-	Status        string  `json:"status"` // running, stopped, failed, not-installed
+	Version       string  `json:"version,omitempty"` // Detected installed version
+	Status        string  `json:"status"`            // running, stopped, failed, not-installed
 	Enabled       bool    `json:"enabled"`
 	CPUPercent    float64 `json:"cpu_percent,omitempty"`
 	MemoryMB      uint64  `json:"memory_mb,omitempty"`
@@ -100,6 +101,7 @@ func CollectServiceStatuses() []ServiceStatus {
 		"mysql",
 		"mariadb",
 		"redis-server",
+		"memcached",
 		"supervisor",
 		"php8.5-fpm",
 		"php8.4-fpm",
@@ -109,6 +111,7 @@ func CollectServiceStatuses() []ServiceStatus {
 		"php8.0-fpm",
 		"php7.4-fpm",
 		"postgresql",
+		"beanstalkd",
 	}
 
 	var statuses []ServiceStatus
@@ -133,6 +136,9 @@ func checkServiceStatus(serviceName string) ServiceStatus {
 		status.Status = "not-installed"
 		return status
 	}
+
+	// Detect installed version
+	status.Version = getServiceVersion(serviceName)
 
 	// Check if active
 	activeCmd := exec.Command("systemctl", "is-active", serviceName)
@@ -159,6 +165,161 @@ func checkServiceStatus(serviceName string) ServiceStatus {
 	}
 
 	return status
+}
+
+// getServiceVersion detects the installed version of a service
+func getServiceVersion(serviceName string) string {
+	var cmd *exec.Cmd
+	var versionPattern string
+
+	switch {
+	case serviceName == "nginx":
+		cmd = exec.Command("nginx", "-v")
+		// nginx -v outputs to stderr: "nginx version: nginx/1.24.0"
+		output, _ := cmd.CombinedOutput()
+		if match := extractVersion(string(output), `nginx/([0-9]+\.[0-9]+\.[0-9]+)`); match != "" {
+			return match
+		}
+		return ""
+
+	case serviceName == "apache2":
+		cmd = exec.Command("apache2", "-v")
+		output, _ := cmd.Output()
+		// "Server version: Apache/2.4.52 (Ubuntu)"
+		if match := extractVersion(string(output), `Apache/([0-9]+\.[0-9]+\.[0-9]+)`); match != "" {
+			return match
+		}
+		return ""
+
+	case serviceName == "mysql":
+		cmd = exec.Command("mysql", "--version")
+		output, _ := cmd.Output()
+		// "mysql  Ver 8.0.35 for Linux..." or "mysql  Ver 8.4.0 for Linux..."
+		if match := extractVersion(string(output), `Ver ([0-9]+\.[0-9]+\.[0-9]+)`); match != "" {
+			return match
+		}
+		return ""
+
+	case serviceName == "mariadb":
+		cmd = exec.Command("mariadb", "--version")
+		output, _ := cmd.Output()
+		// "mariadb  Ver 15.1 Distrib 10.11.4-MariaDB..."
+		if match := extractVersion(string(output), `([0-9]+\.[0-9]+\.[0-9]+)-MariaDB`); match != "" {
+			return match
+		}
+		return ""
+
+	case serviceName == "redis-server":
+		cmd = exec.Command("redis-server", "--version")
+		output, _ := cmd.Output()
+		// "Redis server v=7.2.4 sha=..."
+		if match := extractVersion(string(output), `v=([0-9]+\.[0-9]+\.[0-9]+)`); match != "" {
+			return match
+		}
+		return ""
+
+	case serviceName == "memcached":
+		cmd = exec.Command("memcached", "-h")
+		output, _ := cmd.Output()
+		// "memcached 1.6.18"
+		if match := extractVersion(string(output), `memcached ([0-9]+\.[0-9]+\.[0-9]+)`); match != "" {
+			return match
+		}
+		return ""
+
+	case serviceName == "postgresql":
+		cmd = exec.Command("psql", "--version")
+		output, _ := cmd.Output()
+		// "psql (PostgreSQL) 16.1 (Ubuntu 16.1-1.pgdg22.04+1)"
+		if match := extractVersion(string(output), `([0-9]+\.[0-9]+)`); match != "" {
+			return match
+		}
+		return ""
+
+	case serviceName == "supervisor":
+		cmd = exec.Command("supervisord", "--version")
+		output, _ := cmd.Output()
+		// "4.2.5"
+		return strings.TrimSpace(string(output))
+
+	case serviceName == "beanstalkd":
+		// beanstalkd doesn't have a version flag, check package
+		cmd = exec.Command("dpkg-query", "-W", "-f=${Version}", "beanstalkd")
+		output, _ := cmd.Output()
+		if len(output) > 0 {
+			// Package version like "1.12-2"
+			if match := extractVersion(string(output), `([0-9]+\.[0-9]+)`); match != "" {
+				return match
+			}
+		}
+		return ""
+
+	case strings.HasPrefix(serviceName, "php") && strings.HasSuffix(serviceName, "-fpm"):
+		// Extract PHP version from service name like "php8.4-fpm"
+		versionPattern = strings.TrimPrefix(serviceName, "php")
+		versionPattern = strings.TrimSuffix(versionPattern, "-fpm")
+		// Get actual installed version
+		phpBin := fmt.Sprintf("/usr/bin/php%s", versionPattern)
+		if _, err := os.Stat(phpBin); err == nil {
+			cmd = exec.Command(phpBin, "-v")
+			output, _ := cmd.Output()
+			// "PHP 8.4.1 (cli)..."
+			if match := extractVersion(string(output), `PHP ([0-9]+\.[0-9]+\.[0-9]+)`); match != "" {
+				return match
+			}
+		}
+		return versionPattern // Fall back to version from service name
+	}
+
+	return ""
+}
+
+// extractVersion uses regex to extract version from output
+func extractVersion(output, pattern string) string {
+	// Simple regex matching without importing regexp (to keep binary small)
+	// We'll use a basic approach for common patterns
+	lines := strings.Split(output, "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+
+		// Find the pattern start
+		idx := strings.Index(pattern, "(")
+		if idx == -1 {
+			continue
+		}
+		prefix := pattern[:idx]
+
+		// Find prefix in line
+		prefixIdx := strings.Index(line, prefix)
+		if prefixIdx == -1 {
+			continue
+		}
+
+		// Extract version starting after prefix
+		start := prefixIdx + len(prefix)
+		if start >= len(line) {
+			continue
+		}
+
+		// Extract version numbers
+		var version strings.Builder
+		for i := start; i < len(line); i++ {
+			c := line[i]
+			if (c >= '0' && c <= '9') || c == '.' {
+				version.WriteByte(c)
+			} else if version.Len() > 0 {
+				break
+			}
+		}
+
+		if version.Len() > 0 {
+			return version.String()
+		}
+	}
+	return ""
 }
 
 // collectServiceMetrics collects CPU, memory, and uptime for a running service
