@@ -1,4 +1,4 @@
-module github.com/hostman/hostman-agent
+module github.com/sitekit/sitekit-agent
 
 go 1.23.0
 

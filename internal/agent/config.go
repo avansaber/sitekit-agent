@@ -32,7 +32,7 @@ type Config struct {
 func LoadConfig() (*Config, error) {
 	viper.SetConfigName("agent")
 	viper.SetConfigType("yaml")
-	viper.AddConfigPath("/opt/hostman")
+	viper.AddConfigPath("/opt/sitekit")
 	viper.AddConfigPath(".")
 	viper.AddConfigPath("./configs")
 
@@ -50,17 +50,17 @@ func LoadConfig() (*Config, error) {
 	viper.SetDefault("postgresql.user", "sitekit")
 
 	// Environment variable overrides
-	viper.SetEnvPrefix("HOSTMAN")
+	viper.SetEnvPrefix("SITEKIT")
 	viper.AutomaticEnv()
 
 	// Allow env vars for sensitive data
-	if token := os.Getenv("HOSTMAN_AGENT_TOKEN"); token != "" {
+	if token := os.Getenv("SITEKIT_AGENT_TOKEN"); token != "" {
 		viper.Set("agent_token", token)
 	}
-	if saasURL := os.Getenv("HOSTMAN_SAAS_URL"); saasURL != "" {
+	if saasURL := os.Getenv("SITEKIT_SAAS_URL"); saasURL != "" {
 		viper.Set("saas_url", saasURL)
 	}
-	if serverID := os.Getenv("HOSTMAN_SERVER_ID"); serverID != "" {
+	if serverID := os.Getenv("SITEKIT_SERVER_ID"); serverID != "" {
 		viper.Set("server_id", serverID)
 	}
 

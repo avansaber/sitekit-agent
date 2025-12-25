@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hostman/hostman-agent/internal/comm"
+	"github.com/sitekit/sitekit-agent/internal/comm"
 )
 
 // testDatabaseConfig returns empty database configs for testing

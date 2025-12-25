@@ -9,7 +9,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/hostman/hostman-agent/internal/health"
+	"github.com/sitekit/sitekit-agent/internal/health"
 )
 
 type Client struct {

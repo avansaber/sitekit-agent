@@ -5,9 +5,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/hostman/hostman-agent/internal/comm"
-	"github.com/hostman/hostman-agent/internal/executor"
-	"github.com/hostman/hostman-agent/internal/health"
+	"github.com/sitekit/sitekit-agent/internal/comm"
+	"github.com/sitekit/sitekit-agent/internal/executor"
+	"github.com/sitekit/sitekit-agent/internal/health"
 	"github.com/rs/zerolog/log"
 )
 

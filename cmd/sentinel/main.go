@@ -6,7 +6,7 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/hostman/hostman-agent/internal/agent"
+	"github.com/sitekit/sitekit-agent/internal/agent"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 )
@@ -37,7 +37,7 @@ func main() {
 	log.Info().
 		Str("saas_url", cfg.SaasURL).
 		Str("server_id", cfg.ServerID).
-		Msg("Starting Hostman Sentinel Agent")
+		Msg("Starting SiteKit Sentinel Agent")
 
 	// Create and run agent
 	a := agent.New(cfg)

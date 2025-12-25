@@ -10,7 +10,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/hostman/hostman-agent/internal/comm"
+	"github.com/sitekit/sitekit-agent/internal/comm"
 	"github.com/rs/zerolog/log"
 )
 

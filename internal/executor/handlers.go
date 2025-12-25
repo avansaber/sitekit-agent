@@ -10,7 +10,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/hostman/hostman-agent/internal/comm"
+	"github.com/sitekit/sitekit-agent/internal/comm"
 	"github.com/rs/zerolog/log"
 )
 
@@ -376,7 +376,7 @@ func (e *Executor) handleSSHKeyAdd(ctx context.Context, payload json.RawMessage)
 	}
 	defer f.Close()
 
-	keyWithComment := fmt.Sprintf("# hostman-key-id:%s\n%s\n", p.KeyID, keyLine)
+	keyWithComment := fmt.Sprintf("# sitekit-key-id:%s\n%s\n", p.KeyID, keyLine)
 	if _, err := f.WriteString(keyWithComment); err != nil {
 		return comm.JobResult{Success: false, Error: err.Error()}
 	}
@@ -420,7 +420,7 @@ func (e *Executor) handleSSHKeyRemove(ctx context.Context, payload json.RawMessa
 			skipNext = false
 			continue
 		}
-		if strings.Contains(line, fmt.Sprintf("hostman-key-id:%s", p.KeyID)) {
+		if strings.Contains(line, fmt.Sprintf("sitekit-key-id:%s", p.KeyID)) {
 			skipNext = true
 			continue
 		}
@@ -457,10 +457,10 @@ func (e *Executor) handleSSHKeySync(ctx context.Context, payload json.RawMessage
 	os.MkdirAll(sshDir, 0700)
 
 	var lines []string
-	lines = append(lines, "# Managed by Hostman - Manual changes may be overwritten")
+	lines = append(lines, "# Managed by SiteKit - Manual changes may be overwritten")
 
 	for _, key := range p.Keys {
-		lines = append(lines, fmt.Sprintf("# hostman-key-id:%s", key.KeyID))
+		lines = append(lines, fmt.Sprintf("# sitekit-key-id:%s", key.KeyID))
 		lines = append(lines, strings.TrimSpace(key.PublicKey))
 	}
 
@@ -769,7 +769,7 @@ func (e *Executor) handleIssueSSL(ctx context.Context, payload json.RawMessage) 
 		Msg("Issuing SSL certificate")
 
 	// Fix permissions on webroot path to ensure nginx can serve ACME challenge
-	// This fixes the common issue where /home/hostman has 750 permissions
+	// This fixes the common issue where /home/sitekit has 750 permissions
 	if err := e.fixWebrootPermissions(p.Webroot); err != nil {
 		log.Warn().Err(err).Msg("Failed to fix webroot permissions, continuing anyway")
 	}
@@ -861,7 +861,7 @@ func (e *Executor) handleInstallSSL(ctx context.Context, payload json.RawMessage
 	}
 
 	// Create SSL directory
-	sslDir := fmt.Sprintf("/etc/ssl/hostman/%s", p.Domain)
+	sslDir := fmt.Sprintf("/etc/ssl/sitekit/%s", p.Domain)
 	if err := os.MkdirAll(sslDir, 0700); err != nil {
 		return comm.JobResult{Success: false, Error: "Failed to create SSL directory: " + err.Error()}
 	}
@@ -909,7 +909,7 @@ func (e *Executor) getMySQLArgs(query string) []string {
 		return []string{"-u", e.mysqlConfig.User, "-p" + e.mysqlConfig.Password, "-e", query}
 	}
 	// Fallback to reading root password from file (for backwards compatibility)
-	data, err := os.ReadFile("/opt/hostman/config/.mysql_root")
+	data, err := os.ReadFile("/opt/sitekit/config/.mysql_root")
 	if err == nil {
 		password := strings.TrimSpace(string(data))
 		if password != "" {
@@ -1068,7 +1068,7 @@ func (e *Executor) handleSyncCrontab(ctx context.Context, payload json.RawMessag
 	}
 
 	var crontab strings.Builder
-	crontab.WriteString("# Managed by Hostman - Do not edit directly\n")
+	crontab.WriteString("# Managed by SiteKit - Do not edit directly\n")
 	crontab.WriteString("SHELL=/bin/bash\n")
 	crontab.WriteString("PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin\n\n")
 
@@ -1252,7 +1252,7 @@ func (e *Executor) handleDeploy(ctx context.Context, payload json.RawMessage) co
 
 	// Setup deploy key for SSH authentication
 	if p.DeployKey != "" {
-		keyPath := filepath.Join(os.TempDir(), fmt.Sprintf("hostman-deploy-%s", p.DeploymentID))
+		keyPath := filepath.Join(os.TempDir(), fmt.Sprintf("sitekit-deploy-%s", p.DeploymentID))
 		if err := os.WriteFile(keyPath, []byte(p.DeployKey), 0600); err != nil {
 			return comm.JobResult{Success: false, Output: output.String(), Error: "Failed to write deploy key: " + err.Error()}
 		}
@@ -1331,7 +1331,7 @@ func (e *Executor) handleDeploy(ctx context.Context, payload json.RawMessage) co
 	// Run build script if provided
 	if p.BuildScript != "" {
 		output.WriteString("Running build script...\n")
-		scriptPath := filepath.Join(releaseDir, ".hostman-deploy.sh")
+		scriptPath := filepath.Join(releaseDir, ".sitekit-deploy.sh")
 		scriptContent := "#!/bin/bash\nset -e\ncd " + releaseDir + "\n"
 		if p.PHPVersion != "" {
 			scriptContent += fmt.Sprintf("export PATH=/usr/bin/php%s:$PATH\n", p.PHPVersion)
@@ -1399,7 +1399,7 @@ func (e *Executor) handleRunScript(ctx context.Context, payload json.RawMessage)
 	}
 
 	// Write script to temp file
-	tmpFile, err := os.CreateTemp("", "hostman-script-*.sh")
+	tmpFile, err := os.CreateTemp("", "sitekit-script-*.sh")
 	if err != nil {
 		return comm.JobResult{Success: false, Error: err.Error()}
 	}
@@ -1857,7 +1857,7 @@ func (e *Executor) handleDatabaseBackup(ctx context.Context, payload json.RawMes
 		Msg("Creating database backup")
 
 	// Create backup directory
-	backupDir := "/opt/hostman/backups/databases"
+	backupDir := "/opt/sitekit/backups/databases"
 	if err := os.MkdirAll(backupDir, 0700); err != nil {
 		return comm.JobResult{Success: false, Error: "Failed to create backup directory: " + err.Error()}
 	}
@@ -2866,10 +2866,10 @@ func (e *Executor) handleFixPermissions(ctx context.Context, payload json.RawMes
 
 	var output strings.Builder
 
-	// Fix /home/hostman permissions for nginx access
+	// Fix /home/sitekit permissions for nginx access
 	paths := []string{
-		"/home/hostman",
-		"/home/hostman/web",
+		"/home/sitekit",
+		"/home/sitekit/web",
 	}
 
 	for _, path := range paths {
@@ -2905,7 +2905,7 @@ func (e *Executor) handleFixPermissions(ctx context.Context, payload json.RawMes
 }
 
 // fixWebrootPermissions ensures nginx can traverse to the webroot to serve ACME challenges
-// This fixes the common issue where /home/hostman has 750 permissions but nginx runs as www-data
+// This fixes the common issue where /home/sitekit has 750 permissions but nginx runs as www-data
 func (e *Executor) fixWebrootPermissions(webroot string) error {
 	// Walk up the directory tree and ensure each directory has at least 755 permissions
 	// so nginx (www-data) can traverse to the webroot
