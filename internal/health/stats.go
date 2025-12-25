@@ -96,6 +96,7 @@ func CollectStats() (*SystemStats, error) {
 func CollectServiceStatuses() []ServiceStatus {
 	services := []string{
 		"nginx",
+		"apache2",
 		"mysql",
 		"mariadb",
 		"redis-server",

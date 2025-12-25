@@ -1448,6 +1448,8 @@ func getSystemdServiceName(serviceType, version string) string {
 		return "memcached"
 	case "nginx":
 		return "nginx"
+	case "apache":
+		return "apache2"
 	case "supervisor":
 		return "supervisor"
 	case "beanstalkd":
