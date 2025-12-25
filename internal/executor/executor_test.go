@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/sitekit/sitekit-agent/internal/comm"
+	"github.com/avansaber/sitekit-agent/internal/comm"
 )
 
 // testDatabaseConfig returns empty database configs for testing

@@ -6,7 +6,7 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/sitekit/sitekit-agent/internal/agent"
+	"github.com/avansaber/sitekit-agent/internal/agent"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 )

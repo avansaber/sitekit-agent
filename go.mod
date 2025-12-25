@@ -1,4 +1,4 @@
-module github.com/sitekit/sitekit-agent
+module github.com/avansaber/sitekit-agent
 
 go 1.23.0
 

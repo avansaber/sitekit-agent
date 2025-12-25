@@ -10,7 +10,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/sitekit/sitekit-agent/internal/comm"
+	"github.com/avansaber/sitekit-agent/internal/comm"
 	"github.com/rs/zerolog/log"
 )
 

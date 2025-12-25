@@ -5,9 +5,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/sitekit/sitekit-agent/internal/comm"
-	"github.com/sitekit/sitekit-agent/internal/executor"
-	"github.com/sitekit/sitekit-agent/internal/health"
+	"github.com/avansaber/sitekit-agent/internal/comm"
+	"github.com/avansaber/sitekit-agent/internal/executor"
+	"github.com/avansaber/sitekit-agent/internal/health"
 	"github.com/rs/zerolog/log"
 )
 
