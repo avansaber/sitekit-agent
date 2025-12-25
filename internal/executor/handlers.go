@@ -46,12 +46,23 @@ func (e *Executor) handleServiceStart(ctx context.Context, payload json.RawMessa
 	}
 
 	serviceName := getSystemdServiceName(p.ServiceType, p.Version)
-	output, exitCode, err := e.RunCommandWithExitCode(ctx, "systemctl", "start", serviceName)
+	var output strings.Builder
+
+	// Enable the service first so it starts on boot
+	enableOutput, _, enableErr := e.RunCommandWithExitCode(ctx, "systemctl", "enable", serviceName)
+	output.WriteString(fmt.Sprintf("Enable %s: %s\n", serviceName, enableOutput))
+	if enableErr != nil {
+		log.Warn().Err(enableErr).Str("service", serviceName).Msg("Failed to enable service")
+	}
+
+	// Start the service
+	startOutput, exitCode, startErr := e.RunCommandWithExitCode(ctx, "systemctl", "start", serviceName)
+	output.WriteString(fmt.Sprintf("Start %s: %s\n", serviceName, startOutput))
 
 	return comm.JobResult{
-		Success:  err == nil,
-		Output:   output,
-		Error:    errToString(err),
+		Success:  startErr == nil,
+		Output:   output.String(),
+		Error:    errToString(startErr),
 		ExitCode: exitCode,
 	}
 }
@@ -146,17 +157,45 @@ func (e *Executor) handleServiceUninstall(ctx context.Context, payload json.RawM
 		return comm.JobResult{Success: false, Error: err.Error()}
 	}
 
-	// Stop the service first
 	serviceName := getSystemdServiceName(p.ServiceType, p.Version)
-	e.RunCommand(ctx, "systemctl", "stop", serviceName)
-	e.RunCommand(ctx, "systemctl", "disable", serviceName)
+	var output strings.Builder
+
+	// Stop the service first
+	stopOutput, stopExitCode, stopErr := e.RunCommandWithExitCode(ctx, "systemctl", "stop", serviceName)
+	output.WriteString(fmt.Sprintf("Stop %s: %s\n", serviceName, stopOutput))
+	if stopErr != nil {
+		log.Warn().Err(stopErr).Int("exit_code", stopExitCode).Str("service", serviceName).Msg("Failed to stop service")
+	}
+
+	// Disable the service
+	disableOutput, disableExitCode, disableErr := e.RunCommandWithExitCode(ctx, "systemctl", "disable", serviceName)
+	output.WriteString(fmt.Sprintf("Disable %s: %s\n", serviceName, disableOutput))
+	if disableErr != nil {
+		log.Warn().Err(disableErr).Int("exit_code", disableExitCode).Str("service", serviceName).Msg("Failed to disable service")
+	}
 
 	// Note: We don't actually uninstall packages to avoid breaking other things
 	// Just stop and disable the service
 
+	// Return success only if both operations succeeded
+	success := stopErr == nil && disableErr == nil
+	var errMsg string
+	if !success {
+		if stopErr != nil {
+			errMsg = fmt.Sprintf("stop failed: %v", stopErr)
+		}
+		if disableErr != nil {
+			if errMsg != "" {
+				errMsg += "; "
+			}
+			errMsg += fmt.Sprintf("disable failed: %v", disableErr)
+		}
+	}
+
 	return comm.JobResult{
-		Success: true,
-		Output:  fmt.Sprintf("Service %s stopped and disabled", serviceName),
+		Success: success,
+		Output:  output.String(),
+		Error:   errMsg,
 	}
 }
 
@@ -3003,4 +3042,174 @@ func (e *Executor) getCertbotError(output string) string {
 	}
 
 	return ""
+}
+
+// handleServerRestore cleans up all SiteKit components and restores server to original state
+func (e *Executor) handleServerRestore(ctx context.Context, payload json.RawMessage) comm.JobResult {
+	var p struct {
+		KeepSSHAccess  bool `json:"keep_ssh_access"`
+		RemovePackages bool `json:"remove_packages"`
+		RemoveData     bool `json:"remove_data"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+
+	log.Info().Bool("keep_ssh", p.KeepSSHAccess).Bool("remove_packages", p.RemovePackages).Bool("remove_data", p.RemoveData).Msg("Starting server restore")
+
+	var output strings.Builder
+	var errors []string
+
+	// Step 1: Stop all managed services
+	output.WriteString("=== Stopping services ===\n")
+	services := []string{
+		"nginx", "apache2",
+		"php8.5-fpm", "php8.4-fpm", "php8.3-fpm", "php8.2-fpm", "php8.1-fpm", "php8.0-fpm", "php7.4-fpm",
+		"mysql", "mariadb", "postgresql",
+		"redis-server", "supervisor", "memcached", "beanstalkd",
+	}
+	for _, svc := range services {
+		out, _, _ := e.RunCommandWithExitCode(ctx, "systemctl", "stop", svc)
+		if out != "" {
+			output.WriteString(fmt.Sprintf("Stopped %s\n", svc))
+		}
+	}
+
+	// Step 2: Remove web app data if requested
+	if p.RemoveData {
+		output.WriteString("\n=== Removing web app data ===\n")
+		if out, err := e.RunCommand(ctx, "rm", "-rf", "/home/sitekit"); err == nil {
+			output.WriteString("Removed /home/sitekit\n")
+		} else {
+			output.WriteString(fmt.Sprintf("Remove /home/sitekit: %s\n", out))
+		}
+	}
+
+	// Step 3: Remove packages if requested
+	if p.RemovePackages {
+		output.WriteString("\n=== Removing packages ===\n")
+
+		// Remove packages in groups
+		packageGroups := [][]string{
+			{"nginx", "nginx-common"},
+			{"php8.5-fpm", "php8.5-cli", "php8.5-common"},
+			{"php8.4-fpm", "php8.4-cli", "php8.4-common"},
+			{"php8.3-fpm", "php8.3-cli", "php8.3-common"},
+			{"php8.2-fpm", "php8.2-cli", "php8.2-common"},
+			{"php8.1-fpm", "php8.1-cli", "php8.1-common"},
+			{"mariadb-server", "mariadb-client", "mariadb-common"},
+			{"mysql-server", "mysql-client", "mysql-common"},
+			{"postgresql", "postgresql-contrib", "postgresql-common"},
+			{"redis-server"},
+			{"supervisor"},
+			{"apache2", "apache2-utils"},
+			{"memcached"},
+			{"beanstalkd"},
+			{"certbot", "python3-certbot-nginx"},
+		}
+
+		for _, pkgs := range packageGroups {
+			args := append([]string{"remove", "--purge", "-y"}, pkgs...)
+			out, _, err := e.RunCommandWithExitCode(ctx, "apt-get", args...)
+			if err == nil {
+				output.WriteString(fmt.Sprintf("Removed: %s\n", strings.Join(pkgs, ", ")))
+			} else if out != "" {
+				output.WriteString(fmt.Sprintf("Remove %s: %s\n", pkgs[0], strings.Split(out, "\n")[0]))
+			}
+		}
+
+		// Autoremove unused dependencies
+		output.WriteString("\n=== Cleaning up unused packages ===\n")
+		e.RunCommandWithExitCode(ctx, "apt-get", "autoremove", "-y")
+		e.RunCommandWithExitCode(ctx, "apt-get", "autoclean", "-y")
+		output.WriteString("Autoremove complete\n")
+	}
+
+	// Step 4: Remove configuration files
+	output.WriteString("\n=== Removing configuration files ===\n")
+	configDirs := []string{
+		"/etc/nginx",
+		"/etc/php",
+		"/etc/supervisor",
+		"/etc/letsencrypt",
+		"/var/log/php8.5-fpm", "/var/log/php8.4-fpm", "/var/log/php8.3-fpm",
+		"/var/log/php8.2-fpm", "/var/log/php8.1-fpm",
+		"/var/log/nginx",
+		"/var/run/php",
+	}
+	for _, dir := range configDirs {
+		if _, err := e.RunCommand(ctx, "rm", "-rf", dir); err == nil {
+			output.WriteString(fmt.Sprintf("Removed %s\n", dir))
+		}
+	}
+
+	// Step 5: Remove sitekit user
+	output.WriteString("\n=== Removing sitekit user ===\n")
+	if out, err := e.RunCommand(ctx, "userdel", "-r", "sitekit"); err == nil {
+		output.WriteString("Removed sitekit user\n")
+	} else {
+		output.WriteString(fmt.Sprintf("Remove sitekit user: %s\n", out))
+	}
+
+	// Step 6: Remove sitekit directories (except agent for now)
+	output.WriteString("\n=== Removing sitekit directories ===\n")
+	// Remove everything except the agent binary that's currently running
+	dirsToRemove := []string{
+		"/opt/sitekit/config",
+		"/opt/sitekit/logs",
+		"/opt/sitekit/backups",
+		"/opt/sitekit/tmp",
+	}
+	for _, dir := range dirsToRemove {
+		e.RunCommand(ctx, "rm", "-rf", dir)
+		output.WriteString(fmt.Sprintf("Removed %s\n", dir))
+	}
+
+	// Step 7: Remove PPAs
+	output.WriteString("\n=== Removing PPAs ===\n")
+	ppaFiles := []string{
+		"/etc/apt/sources.list.d/ondrej-ubuntu-php-*.list",
+		"/etc/apt/sources.list.d/ondrej-ubuntu-nginx-*.list",
+		"/etc/apt/sources.list.d/mariadb.list",
+		"/etc/apt/sources.list.d/redis.list",
+	}
+	for _, pattern := range ppaFiles {
+		e.RunCommand(ctx, "bash", "-c", fmt.Sprintf("rm -f %s 2>/dev/null", pattern))
+	}
+	output.WriteString("PPAs removed\n")
+
+	// Step 8: Disable and remove sitekit-agent service
+	output.WriteString("\n=== Removing sitekit-agent service ===\n")
+	e.RunCommandWithExitCode(ctx, "systemctl", "stop", "sitekit-agent.service")
+	e.RunCommandWithExitCode(ctx, "systemctl", "disable", "sitekit-agent.service")
+	e.RunCommand(ctx, "rm", "-f", "/etc/systemd/system/sitekit-agent.service")
+	e.RunCommandWithExitCode(ctx, "systemctl", "daemon-reload")
+	output.WriteString("Agent service removed\n")
+
+	// Step 9: Schedule agent binary removal (after this job completes)
+	// Create a script that will run after agent exits
+	cleanupScript := `#!/bin/bash
+sleep 5
+rm -rf /opt/sitekit
+`
+	cleanupPath := "/tmp/sitekit-cleanup.sh"
+	if err := os.WriteFile(cleanupPath, []byte(cleanupScript), 0755); err == nil {
+		// Run cleanup script in background, detached from this process
+		e.RunCommand(ctx, "bash", "-c", fmt.Sprintf("nohup %s > /dev/null 2>&1 &", cleanupPath))
+		output.WriteString("Scheduled final cleanup\n")
+	}
+
+	output.WriteString("\n=== Server restore complete ===\n")
+
+	// Build error message if any
+	var errMsg string
+	if len(errors) > 0 {
+		errMsg = strings.Join(errors, "; ")
+	}
+
+	return comm.JobResult{
+		Success: len(errors) == 0,
+		Output:  output.String(),
+		Error:   errMsg,
+	}
 }

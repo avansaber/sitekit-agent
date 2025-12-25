@@ -101,6 +101,8 @@ func CollectServiceStatuses() []ServiceStatus {
 		"mariadb",
 		"redis-server",
 		"supervisor",
+		"php8.5-fpm",
+		"php8.4-fpm",
 		"php8.3-fpm",
 		"php8.2-fpm",
 		"php8.1-fpm",

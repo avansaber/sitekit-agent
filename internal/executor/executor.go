@@ -210,5 +210,20 @@ func (e *Executor) RegisterHandlers() {
 	// Health monitoring
 	e.Register("check_services", e.handleCheckServices)
 
+	// Server management
+	e.Register("server_restore", e.handleServerRestore)
+
+	// Provisioning (software installation)
+	e.Register("provision_system", e.handleProvisionSystem)
+	e.Register("provision_nginx", e.handleProvisionNginx)
+	e.Register("provision_php", e.handleProvisionPHP)
+	e.Register("provision_mariadb", e.handleProvisionMariaDB)
+	e.Register("provision_postgresql", e.handleProvisionPostgreSQL)
+	e.Register("provision_redis", e.handleProvisionRedis)
+	e.Register("provision_memcached", e.handleProvisionMemcached)
+	e.Register("provision_composer", e.handleProvisionComposer)
+	e.Register("provision_node", e.handleProvisionNode)
+	e.Register("provision_supervisor", e.handleProvisionSupervisor)
+
 	log.Info().Int("handlers", len(e.handlers)).Msg("Registered job handlers")
 }
