@@ -115,8 +115,29 @@ func CollectServiceStatuses() []ServiceStatus {
 	}
 
 	var statuses []ServiceStatus
+	mariadbDetected := false
 
+	// First pass: check if MariaDB is installed (mysql.service becomes an alias)
 	for _, svc := range services {
+		if svc == "mariadb" {
+			status := checkServiceStatus(svc)
+			if status.Status != "not-installed" {
+				mariadbDetected = true
+				statuses = append(statuses, status)
+			}
+		}
+	}
+
+	// Second pass: collect all other services
+	for _, svc := range services {
+		// Skip mysql if mariadb is detected (mysql.service is just an alias)
+		if svc == "mysql" && mariadbDetected {
+			continue
+		}
+		// Skip mariadb (already processed)
+		if svc == "mariadb" {
+			continue
+		}
 		status := checkServiceStatus(svc)
 		if status.Status != "not-installed" {
 			statuses = append(statuses, status)
