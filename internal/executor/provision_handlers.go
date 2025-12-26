@@ -112,13 +112,30 @@ func (e *Executor) handleProvisionNginx(ctx context.Context, payload json.RawMes
 	log.Info().Int64("step_id", p.StepID).Msg("Provisioning Nginx")
 	var output strings.Builder
 
-	// Check if already installed
+	// Check if properly installed (binary AND config must exist)
+	binaryExists := false
+	configExists := false
+
 	if _, err := os.Stat("/usr/sbin/nginx"); err == nil {
+		binaryExists = true
+	}
+	if _, err := os.Stat("/etc/nginx/nginx.conf"); err == nil {
+		configExists = true
+	}
+
+	if binaryExists && configExists {
 		output.WriteString("Nginx is already installed\n")
 		// Ensure it's running
 		e.RunCommandWithExitCode(ctx, "systemctl", "enable", "nginx")
 		e.RunCommandWithExitCode(ctx, "systemctl", "start", "nginx")
 		return comm.JobResult{Success: true, Output: output.String()}
+	}
+
+	// If binary exists but config doesn't, reinstall
+	if binaryExists && !configExists {
+		output.WriteString("Nginx binary exists but config missing, reinstalling...\n")
+		e.RunCommandWithExitCode(ctx, "apt-get", "purge", "-y", "nginx", "nginx-common")
+		e.RunCommandWithExitCode(ctx, "rm", "-rf", "/etc/nginx")
 	}
 
 	output.WriteString("=== Installing Nginx ===\n")
@@ -167,12 +184,29 @@ func (e *Executor) handleProvisionApache(ctx context.Context, payload json.RawMe
 	log.Info().Int64("step_id", p.StepID).Msg("Provisioning Apache")
 	var output strings.Builder
 
-	// Check if already installed
+	// Check if properly installed (binary AND config directory must exist)
+	binaryExists := false
+	configExists := false
+
 	if _, err := os.Stat("/usr/sbin/apache2"); err == nil {
+		binaryExists = true
+	}
+	if _, err := os.Stat("/etc/apache2/apache2.conf"); err == nil {
+		configExists = true
+	}
+
+	if binaryExists && configExists {
 		output.WriteString("Apache is already installed\n")
 		// Apache is disabled by default - user must start manually
 		e.RunCommandWithExitCode(ctx, "systemctl", "disable", "apache2")
 		return comm.JobResult{Success: true, Output: output.String()}
+	}
+
+	// If binary exists but config doesn't, reinstall
+	if binaryExists && !configExists {
+		output.WriteString("Apache binary exists but config missing, reinstalling...\n")
+		e.RunCommandWithExitCode(ctx, "apt-get", "purge", "-y", "apache2", "apache2-bin", "apache2-utils", "libapache2-mod-fcgid")
+		e.RunCommandWithExitCode(ctx, "rm", "-rf", "/etc/apache2")
 	}
 
 	output.WriteString("=== Installing Apache ===\n")
@@ -296,19 +330,26 @@ func (e *Executor) handleProvisionMariaDB(ctx context.Context, payload json.RawM
 	log.Info().Int64("step_id", p.StepID).Str("version", p.Version).Msg("Provisioning MariaDB")
 	var output strings.Builder
 
-	// Check if MariaDB is already installed (check for mariadb binary specifically)
-	mariadbInstalled := false
+	// Check if MariaDB is properly installed (binary AND data directory must exist)
+	mariadbBinaryExists := false
+	mariadbDataExists := false
+
 	if _, err := os.Stat("/usr/bin/mariadb"); err == nil {
-		mariadbInstalled = true
+		mariadbBinaryExists = true
 	} else if _, err := os.Stat("/usr/bin/mysql"); err == nil {
 		// Check if the mysql binary is actually MariaDB
 		versionOut, _, _ := e.RunCommandWithExitCode(ctx, "mysql", "--version")
 		if strings.Contains(strings.ToLower(versionOut), "mariadb") {
-			mariadbInstalled = true
+			mariadbBinaryExists = true
 		}
 	}
 
-	if mariadbInstalled {
+	// Check if data directory exists and has data
+	if _, err := os.Stat("/var/lib/mysql/mysql"); err == nil {
+		mariadbDataExists = true
+	}
+
+	if mariadbBinaryExists && mariadbDataExists {
 		output.WriteString("MariaDB is already installed\n")
 		// Stop MySQL if it's running (to avoid port conflict)
 		if e.isServiceActive(ctx, "mysql") {
@@ -319,6 +360,13 @@ func (e *Executor) handleProvisionMariaDB(ctx context.Context, payload json.RawM
 		e.RunCommandWithExitCode(ctx, "systemctl", "enable", "mariadb")
 		e.RunCommandWithExitCode(ctx, "systemctl", "start", "mariadb")
 		return comm.JobResult{Success: true, Output: output.String()}
+	}
+
+	// If binary exists but data doesn't, we need to reinstall
+	if mariadbBinaryExists && !mariadbDataExists {
+		output.WriteString("MariaDB binary exists but data directory missing, reinstalling...\n")
+		e.RunCommandWithExitCode(ctx, "apt-get", "purge", "-y", "mariadb-server", "mariadb-client")
+		e.RunCommandWithExitCode(ctx, "rm", "-rf", "/var/lib/mysql", "/etc/mysql")
 	}
 
 	// Stop MySQL if it's running before installing MariaDB
@@ -615,12 +663,29 @@ func (e *Executor) handleProvisionRedis(ctx context.Context, payload json.RawMes
 	log.Info().Int64("step_id", p.StepID).Msg("Provisioning Redis")
 	var output strings.Builder
 
-	// Check if already installed
+	// Check if properly installed (binary AND config file must exist)
+	binaryExists := false
+	configExists := false
+
 	if _, err := os.Stat("/usr/bin/redis-server"); err == nil {
+		binaryExists = true
+	}
+	if _, err := os.Stat("/etc/redis/redis.conf"); err == nil {
+		configExists = true
+	}
+
+	if binaryExists && configExists {
 		output.WriteString("Redis is already installed\n")
 		e.RunCommandWithExitCode(ctx, "systemctl", "enable", "redis-server")
 		e.RunCommandWithExitCode(ctx, "systemctl", "start", "redis-server")
 		return comm.JobResult{Success: true, Output: output.String()}
+	}
+
+	// If binary exists but config doesn't, reinstall
+	if binaryExists && !configExists {
+		output.WriteString("Redis binary exists but config missing, reinstalling...\n")
+		e.RunCommandWithExitCode(ctx, "apt-get", "purge", "-y", "redis-server")
+		e.RunCommandWithExitCode(ctx, "rm", "-rf", "/etc/redis", "/var/lib/redis")
 	}
 
 	output.WriteString("=== Installing Redis ===\n")
@@ -749,11 +814,29 @@ func (e *Executor) handleProvisionSupervisor(ctx context.Context, payload json.R
 	log.Info().Int64("step_id", p.StepID).Msg("Provisioning Supervisor")
 	var output strings.Builder
 
+	// Check if properly installed (binary AND config file must exist)
+	binaryExists := false
+	configExists := false
+
 	if _, err := os.Stat("/usr/bin/supervisord"); err == nil {
+		binaryExists = true
+	}
+	if _, err := os.Stat("/etc/supervisor/supervisord.conf"); err == nil {
+		configExists = true
+	}
+
+	if binaryExists && configExists {
 		output.WriteString("Supervisor is already installed\n")
 		e.RunCommandWithExitCode(ctx, "systemctl", "enable", "supervisor")
 		e.RunCommandWithExitCode(ctx, "systemctl", "start", "supervisor")
 		return comm.JobResult{Success: true, Output: output.String()}
+	}
+
+	// If binary exists but config doesn't, reinstall
+	if binaryExists && !configExists {
+		output.WriteString("Supervisor binary exists but config missing, reinstalling...\n")
+		e.RunCommandWithExitCode(ctx, "apt-get", "purge", "-y", "supervisor")
+		e.RunCommandWithExitCode(ctx, "rm", "-rf", "/etc/supervisor")
 	}
 
 	output.WriteString("=== Installing Supervisor ===\n")
