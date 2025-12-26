@@ -76,24 +76,67 @@ func (e *Executor) handleProvisionSystem(ctx context.Context, payload json.RawMe
 APT::Periodic::Unattended-Upgrade "1";
 APT::Periodic::AutocleanInterval "7";
 `
-	os.WriteFile("/etc/apt/apt.conf.d/20auto-upgrades", []byte(autoUpgradesConf), 0644)
+	if err := os.WriteFile("/etc/apt/apt.conf.d/20auto-upgrades", []byte(autoUpgradesConf), 0644); err != nil {
+		output.WriteString(fmt.Sprintf("Warning: failed to configure auto-upgrades: %v\n", err))
+	}
 	e.RunCommandWithExitCode(ctx, "systemctl", "enable", "unattended-upgrades")
 	output.WriteString("Automatic security updates configured\n")
 
-	// Create swap if needed
+	// Create swap if needed (size based on available RAM)
 	output.WriteString("\n=== Configuring swap ===\n")
 	if _, err := os.Stat("/swapfile"); os.IsNotExist(err) {
-		e.RunCommandWithExitCode(ctx, "fallocate", "-l", "1G", "/swapfile")
+		// Calculate swap size based on RAM
+		// RAM <= 2GB: swap = RAM, RAM 2-8GB: swap = RAM/2, RAM > 8GB: swap = 4GB
+		swapSize := "1G" // default fallback
+		memOut, _, _ := e.RunCommandWithExitCode(ctx, "free", "-m")
+		for _, line := range strings.Split(memOut, "\n") {
+			if strings.HasPrefix(line, "Mem:") {
+				fields := strings.Fields(line)
+				if len(fields) >= 2 {
+					var totalMB int
+					fmt.Sscanf(fields[1], "%d", &totalMB)
+					if totalMB <= 2048 {
+						// RAM <= 2GB: swap = RAM
+						swapSize = fmt.Sprintf("%dM", totalMB)
+					} else if totalMB <= 8192 {
+						// RAM 2-8GB: swap = RAM/2
+						swapSize = fmt.Sprintf("%dM", totalMB/2)
+					} else {
+						// RAM > 8GB: swap = 4GB max
+						swapSize = "4G"
+					}
+					output.WriteString(fmt.Sprintf("Detected %dMB RAM, creating %s swap\n", totalMB, swapSize))
+				}
+				break
+			}
+		}
+
+		// Create swap file (use dd as fallback if fallocate fails on some filesystems)
+		_, exitCode, _ := e.RunCommandWithExitCode(ctx, "fallocate", "-l", swapSize, "/swapfile")
+		if exitCode != 0 {
+			// Fallback to dd for filesystems that don't support fallocate
+			e.RunCommandWithExitCode(ctx, "dd", "if=/dev/zero", "of=/swapfile", "bs=1M", "count=1024", "status=none")
+		}
 		e.RunCommandWithExitCode(ctx, "chmod", "600", "/swapfile")
 		e.RunCommandWithExitCode(ctx, "mkswap", "/swapfile")
-		e.RunCommandWithExitCode(ctx, "swapon", "/swapfile")
-		// Add to fstab
-		f, _ := os.OpenFile("/etc/fstab", os.O_APPEND|os.O_WRONLY, 0644)
-		if f != nil {
-			f.WriteString("/swapfile none swap sw 0 0\n")
-			f.Close()
+		_, swapExitCode, _ := e.RunCommandWithExitCode(ctx, "swapon", "/swapfile")
+
+		if swapExitCode == 0 {
+			// Add to fstab if not already present
+			fstabContent, _ := os.ReadFile("/etc/fstab")
+			if !strings.Contains(string(fstabContent), "/swapfile") {
+				f, err := os.OpenFile("/etc/fstab", os.O_APPEND|os.O_WRONLY, 0644)
+				if err == nil {
+					f.WriteString("/swapfile none swap sw 0 0\n")
+					f.Close()
+				} else {
+					output.WriteString(fmt.Sprintf("Warning: failed to update fstab: %v\n", err))
+				}
+			}
+			output.WriteString(fmt.Sprintf("%s swap file created and activated\n", swapSize))
+		} else {
+			output.WriteString("Warning: failed to activate swap file\n")
 		}
-		output.WriteString("1GB swap file created\n")
 	} else {
 		output.WriteString("Swap already exists\n")
 	}
@@ -167,7 +210,9 @@ server_tokens off;
 # Limit request size
 client_max_body_size 64M;
 `
-	os.WriteFile("/etc/nginx/conf.d/security.conf", []byte(securityConf), 0644)
+	if err := os.WriteFile("/etc/nginx/conf.d/security.conf", []byte(securityConf), 0644); err != nil {
+		output.WriteString(fmt.Sprintf("Warning: failed to write nginx security config: %v\n", err))
+	}
 	e.RunCommandWithExitCode(ctx, "systemctl", "reload", "nginx")
 
 	output.WriteString("Nginx installed and configured\n")
@@ -414,25 +459,29 @@ func (e *Executor) handleProvisionMariaDB(ctx context.Context, payload json.RawM
 	rootPass, _, _ := e.RunCommandWithExitCode(ctx, "openssl", "rand", "-base64", "24")
 	rootPass = strings.TrimSpace(rootPass)
 
-	// Try to secure the installation
-	e.RunCommandWithExitCode(ctx, "mysql", "-e", fmt.Sprintf("ALTER USER 'root'@'localhost' IDENTIFIED BY '%s';", rootPass))
-	e.RunCommandWithExitCode(ctx, "mysql", "-u", "root", "-p"+rootPass, "-e", "DELETE FROM mysql.user WHERE User='';")
-	e.RunCommandWithExitCode(ctx, "mysql", "-u", "root", "-p"+rootPass, "-e", "DROP DATABASE IF EXISTS test;")
-	e.RunCommandWithExitCode(ctx, "mysql", "-u", "root", "-p"+rootPass, "-e", "FLUSH PRIVILEGES;")
+	// Secure the installation (first command runs without auth, then use secure method)
+	e.runMySQLCommandNoAuth(ctx, fmt.Sprintf("ALTER USER 'root'@'localhost' IDENTIFIED BY '%s';", rootPass))
+	e.runMySQLCommand(ctx, "root", rootPass, "DELETE FROM mysql.user WHERE User='';")
+	e.runMySQLCommand(ctx, "root", rootPass, "DROP DATABASE IF EXISTS test;")
+	e.runMySQLCommand(ctx, "root", rootPass, "FLUSH PRIVILEGES;")
 
-	os.WriteFile(configDir+"/.mysql_root", []byte(rootPass), 0600)
+	if err := os.WriteFile(configDir+"/.mysql_root", []byte(rootPass), 0600); err != nil {
+		output.WriteString(fmt.Sprintf("Warning: failed to save root password: %v\n", err))
+	}
 
 	// Create sitekit system user
 	sitekitPass, _, _ := e.RunCommandWithExitCode(ctx, "openssl", "rand", "-base64", "24")
 	sitekitPass = strings.TrimSpace(sitekitPass)
 
-	e.RunCommandWithExitCode(ctx, "mysql", "-u", "root", "-p"+rootPass, "-e",
+	e.runMySQLCommand(ctx, "root", rootPass,
 		fmt.Sprintf("CREATE USER IF NOT EXISTS 'sitekit'@'localhost' IDENTIFIED BY '%s';", sitekitPass))
-	e.RunCommandWithExitCode(ctx, "mysql", "-u", "root", "-p"+rootPass, "-e",
+	e.runMySQLCommand(ctx, "root", rootPass,
 		"GRANT ALL PRIVILEGES ON *.* TO 'sitekit'@'localhost' WITH GRANT OPTION;")
-	e.RunCommandWithExitCode(ctx, "mysql", "-u", "root", "-p"+rootPass, "-e", "FLUSH PRIVILEGES;")
+	e.runMySQLCommand(ctx, "root", rootPass, "FLUSH PRIVILEGES;")
 
-	os.WriteFile(configDir+"/.mysql_sitekit", []byte(sitekitPass), 0600)
+	if err := os.WriteFile(configDir+"/.mysql_sitekit", []byte(sitekitPass), 0600); err != nil {
+		output.WriteString(fmt.Sprintf("Warning: failed to save sitekit password: %v\n", err))
+	}
 
 	// Update agent config with database credentials
 	e.updateAgentConfigWithMySQL(sitekitPass)
@@ -539,26 +588,30 @@ func (e *Executor) handleProvisionMySQL(ctx context.Context, payload json.RawMes
 		rootPass, _, _ := e.RunCommandWithExitCode(ctx, "openssl", "rand", "-base64", "24")
 		rootPass = strings.TrimSpace(rootPass)
 
-		// Secure the installation
-		e.RunCommandWithExitCode(ctx, "mysql", "-e", fmt.Sprintf("ALTER USER 'root'@'localhost' IDENTIFIED WITH caching_sha2_password BY '%s';", rootPass))
-		e.RunCommandWithExitCode(ctx, "mysql", "-u", "root", "-p"+rootPass, "-e", "DELETE FROM mysql.user WHERE User='';")
-		e.RunCommandWithExitCode(ctx, "mysql", "-u", "root", "-p"+rootPass, "-e", "DROP DATABASE IF EXISTS test;")
-		e.RunCommandWithExitCode(ctx, "mysql", "-u", "root", "-p"+rootPass, "-e", "FLUSH PRIVILEGES;")
+		// Secure the installation (first command runs without auth, then use secure method)
+		e.runMySQLCommandNoAuth(ctx, fmt.Sprintf("ALTER USER 'root'@'localhost' IDENTIFIED WITH caching_sha2_password BY '%s';", rootPass))
+		e.runMySQLCommand(ctx, "root", rootPass, "DELETE FROM mysql.user WHERE User='';")
+		e.runMySQLCommand(ctx, "root", rootPass, "DROP DATABASE IF EXISTS test;")
+		e.runMySQLCommand(ctx, "root", rootPass, "FLUSH PRIVILEGES;")
 
 		// Store MySQL 8.x credentials separately from MariaDB
-		os.WriteFile(configDir+"/.mysql8_root", []byte(rootPass), 0600)
+		if err := os.WriteFile(configDir+"/.mysql8_root", []byte(rootPass), 0600); err != nil {
+			output.WriteString(fmt.Sprintf("Warning: failed to save root password: %v\n", err))
+		}
 
 		// Create sitekit system user
 		sitekitPass, _, _ := e.RunCommandWithExitCode(ctx, "openssl", "rand", "-base64", "24")
 		sitekitPass = strings.TrimSpace(sitekitPass)
 
-		e.RunCommandWithExitCode(ctx, "mysql", "-u", "root", "-p"+rootPass, "-e",
+		e.runMySQLCommand(ctx, "root", rootPass,
 			fmt.Sprintf("CREATE USER IF NOT EXISTS 'sitekit'@'localhost' IDENTIFIED WITH caching_sha2_password BY '%s';", sitekitPass))
-		e.RunCommandWithExitCode(ctx, "mysql", "-u", "root", "-p"+rootPass, "-e",
+		e.runMySQLCommand(ctx, "root", rootPass,
 			"GRANT ALL PRIVILEGES ON *.* TO 'sitekit'@'localhost' WITH GRANT OPTION;")
-		e.RunCommandWithExitCode(ctx, "mysql", "-u", "root", "-p"+rootPass, "-e", "FLUSH PRIVILEGES;")
+		e.runMySQLCommand(ctx, "root", rootPass, "FLUSH PRIVILEGES;")
 
-		os.WriteFile(configDir+"/.mysql8_sitekit", []byte(sitekitPass), 0600)
+		if err := os.WriteFile(configDir+"/.mysql8_sitekit", []byte(sitekitPass), 0600); err != nil {
+			output.WriteString(fmt.Sprintf("Warning: failed to save sitekit password: %v\n", err))
+		}
 
 		// Restore original state
 		if !wasRunning {
@@ -913,4 +966,36 @@ func (e *Executor) isServiceActive(ctx context.Context, serviceName string) bool
 func (e *Executor) isServiceInstalled(ctx context.Context, serviceName string) bool {
 	_, exitCode, _ := e.RunCommandWithExitCode(ctx, "systemctl", "list-unit-files", serviceName+".service")
 	return exitCode == 0
+}
+
+// runMySQLCommand executes a MySQL command securely without exposing password in process list
+// Uses a temporary defaults file instead of passing password as command argument
+func (e *Executor) runMySQLCommand(ctx context.Context, user, password, query string) (string, int, error) {
+	// Create temporary defaults file with credentials
+	tmpFile, err := os.CreateTemp("", "mysql-defaults-*.cnf")
+	if err != nil {
+		return "", -1, fmt.Errorf("failed to create temp file: %w", err)
+	}
+	defer os.Remove(tmpFile.Name())
+
+	// Write credentials to temp file (not visible in process list)
+	defaultsContent := fmt.Sprintf("[client]\nuser=%s\npassword=%s\n", user, password)
+	if _, err := tmpFile.WriteString(defaultsContent); err != nil {
+		tmpFile.Close()
+		return "", -1, fmt.Errorf("failed to write defaults file: %w", err)
+	}
+	tmpFile.Close()
+
+	// Set restrictive permissions
+	if err := os.Chmod(tmpFile.Name(), 0600); err != nil {
+		return "", -1, fmt.Errorf("failed to set file permissions: %w", err)
+	}
+
+	// Run mysql with defaults file (password not visible in ps/htop)
+	return e.RunCommandWithExitCode(ctx, "mysql", fmt.Sprintf("--defaults-extra-file=%s", tmpFile.Name()), "-e", query)
+}
+
+// runMySQLCommandNoAuth executes a MySQL command without authentication (for initial setup)
+func (e *Executor) runMySQLCommandNoAuth(ctx context.Context, query string) (string, int, error) {
+	return e.RunCommandWithExitCode(ctx, "mysql", "-e", query)
 }
