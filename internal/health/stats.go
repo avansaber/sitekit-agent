@@ -1,0 +1,844 @@
+package health
+
+import (
+	"fmt"
+	"os"
+	"os/exec"
+	"runtime"
+	"strings"
+	"time"
+
+	"github.com/shirou/gopsutil/v3/cpu"
+	"github.com/shirou/gopsutil/v3/disk"
+	"github.com/shirou/gopsutil/v3/host"
+	"github.com/shirou/gopsutil/v3/load"
+	"github.com/shirou/gopsutil/v3/mem"
+)
+
+type SystemStats struct {
+	CPUPercent    float64 `json:"cpu_percent"`
+	CPUCount      int     `json:"cpu_count"`
+	MemoryPercent float64 `json:"memory_percent"`
+	MemoryUsedMB  uint64  `json:"memory_used_mb"`
+	MemoryTotalMB uint64  `json:"memory_total_mb"`
+	DiskPercent   float64 `json:"disk_percent"`
+	DiskUsedGB    uint64  `json:"disk_used_gb"`
+	DiskTotalGB   uint64  `json:"disk_total_gb"`
+	LoadAvg1      float64 `json:"load_avg_1"`
+	LoadAvg5      float64 `json:"load_avg_5"`
+	LoadAvg15     float64 `json:"load_avg_15"`
+	OSName        string  `json:"os_name"`
+	OSVersion     string  `json:"os_version"`
+}
+
+type ServiceStatus struct {
+	Name          string  `json:"name"`
+	Version       string  `json:"version,omitempty"` // Detected installed version
+	Status        string  `json:"status"`            // running, stopped, failed, not-installed
+	Enabled       bool    `json:"enabled"`
+	CPUPercent    float64 `json:"cpu_percent,omitempty"`
+	MemoryMB      uint64  `json:"memory_mb,omitempty"`
+	UptimeSeconds uint64  `json:"uptime_seconds,omitempty"`
+}
+
+type DaemonStatus struct {
+	Name          string  `json:"name"`
+	Status        string  `json:"status"` // RUNNING, STOPPED, STARTING, BACKOFF, STOPPING, EXITED, FATAL, UNKNOWN
+	PID           int     `json:"pid,omitempty"`
+	CPUPercent    float64 `json:"cpu_percent,omitempty"`
+	MemoryMB      uint64  `json:"memory_mb,omitempty"`
+	UptimeSeconds uint64  `json:"uptime_seconds,omitempty"`
+}
+
+type ToolStatus struct {
+	Name    string `json:"name"`
+	Version string `json:"version"`
+	Path    string `json:"path,omitempty"`
+}
+
+func CollectStats() (*SystemStats, error) {
+	stats := &SystemStats{
+		CPUCount: runtime.NumCPU(),
+	}
+
+	// CPU percent
+	cpuPercent, err := cpu.Percent(0, false)
+	if err == nil && len(cpuPercent) > 0 {
+		stats.CPUPercent = cpuPercent[0]
+	}
+
+	// Memory
+	memInfo, err := mem.VirtualMemory()
+	if err == nil {
+		stats.MemoryPercent = memInfo.UsedPercent
+		stats.MemoryUsedMB = memInfo.Used / 1024 / 1024
+		stats.MemoryTotalMB = memInfo.Total / 1024 / 1024
+	}
+
+	// Disk
+	diskInfo, err := disk.Usage("/")
+	if err == nil {
+		stats.DiskPercent = diskInfo.UsedPercent
+		stats.DiskUsedGB = diskInfo.Used / 1024 / 1024 / 1024
+		stats.DiskTotalGB = diskInfo.Total / 1024 / 1024 / 1024
+	}
+
+	// Load average
+	loadInfo, err := load.Avg()
+	if err == nil {
+		stats.LoadAvg1 = loadInfo.Load1
+		stats.LoadAvg5 = loadInfo.Load5
+		stats.LoadAvg15 = loadInfo.Load15
+	}
+
+	// OS info
+	hostInfo, err := host.Info()
+	if err == nil {
+		stats.OSName = hostInfo.Platform
+		stats.OSVersion = hostInfo.PlatformVersion
+	}
+
+	return stats, nil
+}
+
+func CollectServiceStatuses() []ServiceStatus {
+	services := []string{
+		"nginx",
+		"apache2",
+		"mysql",
+		"mariadb",
+		"redis-server",
+		"memcached",
+		"supervisor",
+		"php8.5-fpm",
+		"php8.4-fpm",
+		"php8.3-fpm",
+		"php8.2-fpm",
+		"php8.1-fpm",
+		"php8.0-fpm",
+		"php7.4-fpm",
+		"postgresql",
+		"beanstalkd",
+	}
+
+	var statuses []ServiceStatus
+	mariadbDetected := false
+
+	// First pass: check if MariaDB is installed (mysql.service becomes an alias)
+	for _, svc := range services {
+		if svc == "mariadb" {
+			status := checkServiceStatus(svc)
+			if status.Status != "not-installed" {
+				mariadbDetected = true
+				statuses = append(statuses, status)
+			}
+		}
+	}
+
+	// Second pass: collect all other services
+	for _, svc := range services {
+		// Skip mysql if mariadb is detected (mysql.service is just an alias)
+		if svc == "mysql" && mariadbDetected {
+			continue
+		}
+		// Skip mariadb (already processed)
+		if svc == "mariadb" {
+			continue
+		}
+		status := checkServiceStatus(svc)
+		if status.Status != "not-installed" {
+			statuses = append(statuses, status)
+		}
+	}
+
+	return statuses
+}
+
+func checkServiceStatus(serviceName string) ServiceStatus {
+	status := ServiceStatus{Name: serviceName}
+
+	// Check if service unit exists
+	checkCmd := exec.Command("systemctl", "list-unit-files", serviceName+".service")
+	output, err := checkCmd.Output()
+	if err != nil || !strings.Contains(string(output), serviceName) {
+		status.Status = "not-installed"
+		return status
+	}
+
+	// Detect installed version
+	status.Version = getServiceVersion(serviceName)
+
+	// Check if active
+	activeCmd := exec.Command("systemctl", "is-active", serviceName)
+	activeOutput, _ := activeCmd.Output()
+	activeStatus := strings.TrimSpace(string(activeOutput))
+
+	switch activeStatus {
+	case "active":
+		status.Status = "running"
+	case "failed":
+		status.Status = "failed"
+	default:
+		status.Status = "stopped"
+	}
+
+	// Check if enabled
+	enabledCmd := exec.Command("systemctl", "is-enabled", serviceName)
+	enabledOutput, _ := enabledCmd.Output()
+	status.Enabled = strings.TrimSpace(string(enabledOutput)) == "enabled"
+
+	// Collect metrics for running services
+	if status.Status == "running" {
+		collectServiceMetrics(&status, serviceName)
+	}
+
+	return status
+}
+
+// getServiceVersion detects the installed version of a service
+func getServiceVersion(serviceName string) string {
+	var cmd *exec.Cmd
+	var versionPattern string
+
+	switch {
+	case serviceName == "nginx":
+		cmd = exec.Command("nginx", "-v")
+		// nginx -v outputs to stderr: "nginx version: nginx/1.24.0"
+		output, _ := cmd.CombinedOutput()
+		if match := extractVersion(string(output), `nginx/([0-9]+\.[0-9]+\.[0-9]+)`); match != "" {
+			return match
+		}
+		return ""
+
+	case serviceName == "apache2":
+		cmd = exec.Command("apache2", "-v")
+		output, _ := cmd.Output()
+		// "Server version: Apache/2.4.52 (Ubuntu)"
+		if match := extractVersion(string(output), `Apache/([0-9]+\.[0-9]+\.[0-9]+)`); match != "" {
+			return match
+		}
+		return ""
+
+	case serviceName == "mysql":
+		cmd = exec.Command("mysql", "--version")
+		output, _ := cmd.Output()
+		// "mysql  Ver 8.0.35 for Linux..." or "mysql  Ver 8.4.0 for Linux..."
+		if match := extractVersion(string(output), `Ver ([0-9]+\.[0-9]+\.[0-9]+)`); match != "" {
+			return match
+		}
+		return ""
+
+	case serviceName == "mariadb":
+		cmd = exec.Command("mariadb", "--version")
+		output, _ := cmd.Output()
+		// "mariadb  Ver 15.1 Distrib 10.11.4-MariaDB..."
+		if match := extractVersion(string(output), `([0-9]+\.[0-9]+\.[0-9]+)-MariaDB`); match != "" {
+			return match
+		}
+		return ""
+
+	case serviceName == "redis-server":
+		cmd = exec.Command("redis-server", "--version")
+		output, _ := cmd.Output()
+		// "Redis server v=7.2.4 sha=..."
+		if match := extractVersion(string(output), `v=([0-9]+\.[0-9]+\.[0-9]+)`); match != "" {
+			return match
+		}
+		return ""
+
+	case serviceName == "memcached":
+		cmd = exec.Command("memcached", "-h")
+		output, _ := cmd.Output()
+		// "memcached 1.6.18"
+		if match := extractVersion(string(output), `memcached ([0-9]+\.[0-9]+\.[0-9]+)`); match != "" {
+			return match
+		}
+		return ""
+
+	case serviceName == "postgresql":
+		cmd = exec.Command("psql", "--version")
+		output, _ := cmd.Output()
+		// "psql (PostgreSQL) 16.1 (Ubuntu 16.1-1.pgdg22.04+1)"
+		if match := extractVersion(string(output), `([0-9]+\.[0-9]+)`); match != "" {
+			return match
+		}
+		return ""
+
+	case serviceName == "supervisor":
+		cmd = exec.Command("supervisord", "--version")
+		output, _ := cmd.Output()
+		// "4.2.5"
+		return strings.TrimSpace(string(output))
+
+	case serviceName == "beanstalkd":
+		// beanstalkd doesn't have a version flag, check package
+		cmd = exec.Command("dpkg-query", "-W", "-f=${Version}", "beanstalkd")
+		output, _ := cmd.Output()
+		if len(output) > 0 {
+			// Package version like "1.12-2"
+			if match := extractVersion(string(output), `([0-9]+\.[0-9]+)`); match != "" {
+				return match
+			}
+		}
+		return ""
+
+	case strings.HasPrefix(serviceName, "php") && strings.HasSuffix(serviceName, "-fpm"):
+		// Extract PHP version from service name like "php8.4-fpm"
+		versionPattern = strings.TrimPrefix(serviceName, "php")
+		versionPattern = strings.TrimSuffix(versionPattern, "-fpm")
+		// Get actual installed version
+		phpBin := fmt.Sprintf("/usr/bin/php%s", versionPattern)
+		if _, err := os.Stat(phpBin); err == nil {
+			cmd = exec.Command(phpBin, "-v")
+			output, _ := cmd.Output()
+			// "PHP 8.4.1 (cli)..."
+			if match := extractVersion(string(output), `PHP ([0-9]+\.[0-9]+\.[0-9]+)`); match != "" {
+				return match
+			}
+		}
+		return versionPattern // Fall back to version from service name
+	}
+
+	return ""
+}
+
+// extractVersion uses regex to extract version from output
+func extractVersion(output, pattern string) string {
+	// Simple regex matching without importing regexp (to keep binary small)
+	// We'll use a basic approach for common patterns
+	lines := strings.Split(output, "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+
+		// Find the pattern start
+		idx := strings.Index(pattern, "(")
+		if idx == -1 {
+			continue
+		}
+		prefix := pattern[:idx]
+
+		// Find prefix in line
+		prefixIdx := strings.Index(line, prefix)
+		if prefixIdx == -1 {
+			continue
+		}
+
+		// Extract version starting after prefix
+		start := prefixIdx + len(prefix)
+		if start >= len(line) {
+			continue
+		}
+
+		// Extract version numbers
+		var version strings.Builder
+		for i := start; i < len(line); i++ {
+			c := line[i]
+			if (c >= '0' && c <= '9') || c == '.' {
+				version.WriteByte(c)
+			} else if version.Len() > 0 {
+				break
+			}
+		}
+
+		if version.Len() > 0 {
+			return version.String()
+		}
+	}
+	return ""
+}
+
+// collectServiceMetrics collects CPU, memory, and uptime for a running service
+func collectServiceMetrics(status *ServiceStatus, serviceName string) {
+	// Get MainPID and uptime using systemctl show
+	showCmd := exec.Command("systemctl", "show", serviceName, "--property=MainPID,ActiveEnterTimestamp,MemoryCurrent,CPUUsageNSec")
+	showOutput, err := showCmd.Output()
+	if err != nil {
+		return
+	}
+
+	props := parseSystemctlShow(string(showOutput))
+
+	// Parse MainPID
+	pid := props["MainPID"]
+	if pid == "" || pid == "0" {
+		return
+	}
+
+	// Calculate uptime from ActiveEnterTimestamp
+	if ts := props["ActiveEnterTimestamp"]; ts != "" {
+		status.UptimeSeconds = parseUptimeFromTimestamp(ts)
+	}
+
+	// Memory (MemoryCurrent is in bytes, may not be available on all systems)
+	if mem := props["MemoryCurrent"]; mem != "" && mem != "[not set]" {
+		if memBytes := parseUint64(mem); memBytes > 0 {
+			status.MemoryMB = memBytes / 1024 / 1024
+		}
+	}
+
+	// CPU usage (this is cumulative, not percentage - we'll use it as a rough indicator)
+	// For accurate percentage, we'd need to sample over time
+	// For now, we'll get per-process CPU from /proc
+	if cpuPercent := getProcessCPU(pid); cpuPercent >= 0 {
+		status.CPUPercent = cpuPercent
+	}
+}
+
+func parseSystemctlShow(output string) map[string]string {
+	result := make(map[string]string)
+	for _, line := range strings.Split(output, "\n") {
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) == 2 {
+			result[parts[0]] = parts[1]
+		}
+	}
+	return result
+}
+
+func parseUptimeFromTimestamp(ts string) uint64 {
+	// Format: "Mon 2024-01-15 10:30:45 UTC"
+	// We need to parse this and calculate seconds since then
+	cmd := exec.Command("date", "-d", ts, "+%s")
+	output, err := cmd.Output()
+	if err != nil {
+		return 0
+	}
+	startTime := parseUint64(strings.TrimSpace(string(output)))
+
+	nowCmd := exec.Command("date", "+%s")
+	nowOutput, err := nowCmd.Output()
+	if err != nil {
+		return 0
+	}
+	nowTime := parseUint64(strings.TrimSpace(string(nowOutput)))
+
+	if nowTime > startTime {
+		return nowTime - startTime
+	}
+	return 0
+}
+
+func parseUint64(s string) uint64 {
+	var val uint64
+	for _, c := range s {
+		if c >= '0' && c <= '9' {
+			val = val*10 + uint64(c-'0')
+		} else {
+			break
+		}
+	}
+	return val
+}
+
+func getProcessCPU(pid string) float64 {
+	// Use ps to get CPU percentage
+	cmd := exec.Command("ps", "-p", pid, "-o", "%cpu", "--no-headers")
+	output, err := cmd.Output()
+	if err != nil {
+		return -1
+	}
+
+	cpuStr := strings.TrimSpace(string(output))
+	if cpuStr == "" {
+		return 0
+	}
+
+	// Parse float
+	var cpu float64
+	for i, c := range cpuStr {
+		if c == '.' {
+			// Parse decimal part
+			var decimal float64
+			var factor float64 = 0.1
+			for _, d := range cpuStr[i+1:] {
+				if d >= '0' && d <= '9' {
+					decimal += float64(d-'0') * factor
+					factor /= 10
+				} else {
+					break
+				}
+			}
+			cpu += decimal
+			break
+		} else if c >= '0' && c <= '9' {
+			cpu = cpu*10 + float64(c-'0')
+		}
+	}
+
+	return cpu
+}
+
+func GetMachineID() string {
+	// Try Linux machine-id
+	if data, err := os.ReadFile("/etc/machine-id"); err == nil {
+		return strings.TrimSpace(string(data))
+	}
+
+	// Fallback to hostname
+	hostname, _ := os.Hostname()
+	return hostname
+}
+
+// DatabaseHealth represents the health status of a database service
+type DatabaseHealth struct {
+	Status     string `json:"status"`      // ok, error, not_installed
+	ResponseMs int64  `json:"response_ms"` // Response time in milliseconds
+	Error      string `json:"error,omitempty"`
+}
+
+// CollectDatabaseHealth checks connectivity to installed database services
+func CollectDatabaseHealth() map[string]DatabaseHealth {
+	health := make(map[string]DatabaseHealth)
+
+	// Check MariaDB/MySQL
+	if isServiceInstalled("mariadb") || isServiceInstalled("mysql") {
+		health["mysql"] = checkMySQLHealth()
+	}
+
+	// Check PostgreSQL
+	if isServiceInstalled("postgresql") {
+		health["postgresql"] = checkPostgreSQLHealth()
+	}
+
+	return health
+}
+
+func isServiceInstalled(serviceName string) bool {
+	cmd := exec.Command("systemctl", "list-unit-files", serviceName+".service")
+	output, err := cmd.Output()
+	if err != nil {
+		return false
+	}
+	return strings.Contains(string(output), serviceName)
+}
+
+func checkMySQLHealth() DatabaseHealth {
+	start := time.Now()
+
+	// Try to read sitekit credentials
+	configDir := "/opt/sitekit/config"
+	var password string
+	var user string
+
+	// Try sitekit user first
+	if data, err := os.ReadFile(configDir + "/.mysql_sitekit"); err == nil {
+		password = strings.TrimSpace(string(data))
+		user = "sitekit"
+	} else if data, err := os.ReadFile(configDir + "/.mysql8_sitekit"); err == nil {
+		password = strings.TrimSpace(string(data))
+		user = "sitekit"
+	}
+
+	if password == "" {
+		// No credentials found, try socket auth
+		var cmd *exec.Cmd
+		if _, err := os.Stat("/usr/bin/mariadb"); err == nil {
+			cmd = exec.Command("mariadb", "-e", "SELECT 1")
+		} else {
+			cmd = exec.Command("mysql", "-e", "SELECT 1")
+		}
+		_, err := cmd.CombinedOutput()
+		elapsed := time.Since(start).Milliseconds()
+
+		if err != nil {
+			return DatabaseHealth{
+				Status:     "error",
+				ResponseMs: elapsed,
+				Error:      "Connection failed: " + err.Error(),
+			}
+		}
+		return DatabaseHealth{
+			Status:     "ok",
+			ResponseMs: elapsed,
+		}
+	}
+
+	// Create temp defaults file for secure password passing
+	tmpFile, err := os.CreateTemp("", "mysql-health-*.cnf")
+	if err != nil {
+		return DatabaseHealth{
+			Status: "error",
+			Error:  "Failed to create temp file",
+		}
+	}
+	defer os.Remove(tmpFile.Name())
+
+	defaultsContent := fmt.Sprintf("[client]\nuser=%s\npassword=%s\n", user, password)
+	tmpFile.WriteString(defaultsContent)
+	tmpFile.Close()
+	os.Chmod(tmpFile.Name(), 0600)
+
+	// Run health check query
+	var cmd *exec.Cmd
+	if _, err := os.Stat("/usr/bin/mariadb"); err == nil {
+		cmd = exec.Command("mariadb", fmt.Sprintf("--defaults-extra-file=%s", tmpFile.Name()), "-e", "SELECT 1")
+	} else {
+		cmd = exec.Command("mysql", fmt.Sprintf("--defaults-extra-file=%s", tmpFile.Name()), "-e", "SELECT 1")
+	}
+
+	_, err = cmd.CombinedOutput()
+	elapsed := time.Since(start).Milliseconds()
+
+	if err != nil {
+		return DatabaseHealth{
+			Status:     "error",
+			ResponseMs: elapsed,
+			Error:      "Connection failed: " + err.Error(),
+		}
+	}
+
+	return DatabaseHealth{
+		Status:     "ok",
+		ResponseMs: elapsed,
+	}
+}
+
+func checkPostgreSQLHealth() DatabaseHealth {
+	start := time.Now()
+
+	// Try to read sitekit credentials
+	configDir := "/opt/sitekit/config"
+	var password string
+
+	if data, err := os.ReadFile(configDir + "/.pgsql_sitekit"); err == nil {
+		password = strings.TrimSpace(string(data))
+	}
+
+	var cmd *exec.Cmd
+	if password != "" {
+		// Use password auth
+		cmd = exec.Command("psql", "-U", "sitekit", "-h", "localhost", "-c", "SELECT 1")
+		cmd.Env = append(os.Environ(), "PGPASSWORD="+password)
+	} else {
+		// Try peer auth as postgres user
+		cmd = exec.Command("sudo", "-u", "postgres", "psql", "-c", "SELECT 1")
+	}
+
+	_, err := cmd.CombinedOutput()
+	elapsed := time.Since(start).Milliseconds()
+
+	if err != nil {
+		return DatabaseHealth{
+			Status:     "error",
+			ResponseMs: elapsed,
+			Error:      "Connection failed: " + err.Error(),
+		}
+	}
+
+	return DatabaseHealth{
+		Status:     "ok",
+		ResponseMs: elapsed,
+	}
+}
+
+// CollectDaemonStatuses collects status for all supervisor-managed programs
+func CollectDaemonStatuses() []DaemonStatus {
+	var daemons []DaemonStatus
+
+	// Run supervisorctl status to get all programs
+	cmd := exec.Command("supervisorctl", "status")
+	output, err := cmd.Output()
+	if err != nil {
+		// Supervisor might not be running or installed
+		return daemons
+	}
+
+	// Parse output lines
+	// Format: program_name                    STATUS     pid PID, uptime H:MM:SS
+	// Example: laravel-worker:laravel-worker_00   RUNNING    pid 12345, uptime 1:23:45
+	lines := strings.Split(string(output), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+
+		daemon := parseSupervisorStatusLine(line)
+		if daemon.Name != "" {
+			// Collect metrics for running daemons
+			if daemon.Status == "RUNNING" && daemon.PID > 0 {
+				collectDaemonMetrics(&daemon)
+			}
+			daemons = append(daemons, daemon)
+		}
+	}
+
+	return daemons
+}
+
+func parseSupervisorStatusLine(line string) DaemonStatus {
+	daemon := DaemonStatus{}
+
+	// Split by whitespace
+	fields := strings.Fields(line)
+	if len(fields) < 2 {
+		return daemon
+	}
+
+	daemon.Name = fields[0]
+	daemon.Status = fields[1]
+
+	// Parse PID if present (format: "pid 12345,")
+	for i, field := range fields {
+		if field == "pid" && i+1 < len(fields) {
+			pidStr := strings.TrimSuffix(fields[i+1], ",")
+			daemon.PID = int(parseUint64(pidStr))
+		}
+		if field == "uptime" && i+1 < len(fields) {
+			daemon.UptimeSeconds = parseUptimeString(fields[i+1])
+		}
+	}
+
+	return daemon
+}
+
+func parseUptimeString(uptime string) uint64 {
+	// Format: H:MM:SS or D days, H:MM:SS
+	var total uint64
+
+	// Check for days
+	if strings.Contains(uptime, "days,") {
+		parts := strings.SplitN(uptime, "days,", 2)
+		days := parseUint64(strings.TrimSpace(parts[0]))
+		total += days * 24 * 3600
+		if len(parts) > 1 {
+			uptime = strings.TrimSpace(parts[1])
+		}
+	} else if strings.Contains(uptime, "day,") {
+		parts := strings.SplitN(uptime, "day,", 2)
+		days := parseUint64(strings.TrimSpace(parts[0]))
+		total += days * 24 * 3600
+		if len(parts) > 1 {
+			uptime = strings.TrimSpace(parts[1])
+		}
+	}
+
+	// Parse H:MM:SS
+	timeParts := strings.Split(uptime, ":")
+	if len(timeParts) == 3 {
+		hours := parseUint64(timeParts[0])
+		mins := parseUint64(timeParts[1])
+		secs := parseUint64(timeParts[2])
+		total += hours*3600 + mins*60 + secs
+	}
+
+	return total
+}
+
+func collectDaemonMetrics(daemon *DaemonStatus) {
+	if daemon.PID <= 0 {
+		return
+	}
+
+	pidStr := fmt.Sprintf("%d", daemon.PID)
+
+	// Get CPU percentage
+	if cpu := getProcessCPU(pidStr); cpu >= 0 {
+		daemon.CPUPercent = cpu
+	}
+
+	// Get memory usage from /proc/PID/status
+	statusPath := fmt.Sprintf("/proc/%d/status", daemon.PID)
+	data, err := os.ReadFile(statusPath)
+	if err != nil {
+		return
+	}
+
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(line, "VmRSS:") {
+			// Format: VmRSS:     12345 kB
+			fields := strings.Fields(line)
+			if len(fields) >= 2 {
+				kbytes := parseUint64(fields[1])
+				daemon.MemoryMB = kbytes / 1024
+			}
+			break
+		}
+	}
+}
+
+// CollectToolStatuses detects installed CLI tools and their versions
+func CollectToolStatuses() []ToolStatus {
+	var tools []ToolStatus
+
+	// Define tools to check with their version commands
+	toolChecks := []struct {
+		name       string
+		binary     string
+		versionCmd []string
+		pattern    string
+	}{
+		{"node", "node", []string{"-v"}, "v"},
+		{"npm", "npm", []string{"-v"}, ""},
+		{"yarn", "yarn", []string{"-v"}, ""},
+		{"composer", "composer", []string{"-V"}, "Composer version "},
+		{"git", "git", []string{"--version"}, "git version "},
+		{"certbot", "certbot", []string{"--version"}, "certbot "},
+		{"wp-cli", "wp", []string{"--version", "--allow-root"}, "WP-CLI "},
+	}
+
+	for _, tc := range toolChecks {
+		tool := checkToolStatus(tc.name, tc.binary, tc.versionCmd, tc.pattern)
+		if tool != nil {
+			tools = append(tools, *tool)
+		}
+	}
+
+	return tools
+}
+
+func checkToolStatus(name, binary string, versionCmd []string, pattern string) *ToolStatus {
+	// First check if binary exists
+	pathCmd := exec.Command("which", binary)
+	pathOutput, err := pathCmd.Output()
+	if err != nil {
+		return nil // Tool not installed
+	}
+
+	path := strings.TrimSpace(string(pathOutput))
+	if path == "" {
+		return nil
+	}
+
+	// Get version
+	cmd := exec.Command(binary, versionCmd...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		// Tool exists but version check failed
+		return &ToolStatus{
+			Name:    name,
+			Version: "unknown",
+			Path:    path,
+		}
+	}
+
+	version := strings.TrimSpace(string(output))
+
+	// Clean up version string
+	if pattern != "" {
+		if idx := strings.Index(version, pattern); idx != -1 {
+			version = version[idx+len(pattern):]
+		}
+	}
+
+	// Remove leading 'v' if present (for node)
+	version = strings.TrimPrefix(version, "v")
+
+	// Take first line only and first word
+	if idx := strings.Index(version, "\n"); idx != -1 {
+		version = version[:idx]
+	}
+	if idx := strings.Index(version, " "); idx != -1 {
+		version = version[:idx]
+	}
+
+	return &ToolStatus{
+		Name:    name,
+		Version: version,
+		Path:    path,
+	}
+}
+
