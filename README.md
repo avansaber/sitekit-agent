@@ -102,9 +102,7 @@ You are permitted to use, copy, modify, and distribute this software for any pur
 
 1. **Server Limit**: You may not use this software to manage more than **20 servers** without obtaining a commercial license.
 
-2. **Web Applications Limit**: You may not use this software to deploy more than **5 web applications per server** without obtaining a commercial license.
-
-3. **Revenue Limit**: If you offer this software as a hosted service (SaaS), your annual revenue from such service must not exceed **$100,000 USD** without obtaining a commercial license.
+2. **Revenue Limit**: If you offer this software as a hosted service (SaaS), your annual revenue from such service must not exceed **$100,000 USD** without obtaining a commercial license.
 
 4. **Attribution**: You must retain this license notice and attribution in all copies or substantial portions of the software.
 

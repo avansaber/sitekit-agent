@@ -943,6 +943,38 @@ func (e *Executor) handleProvisionNode(ctx context.Context, payload json.RawMess
 	// Update npm
 	e.RunCommandWithExitCode(ctx, "npm", "install", "-g", "npm@latest")
 
+	// Install Yarn globally
+	yarnCheck, _, _ := e.RunCommandWithExitCode(ctx, "which", "yarn")
+	if strings.TrimSpace(yarnCheck) == "" {
+		yarnOut, _, yarnErr := e.RunCommandWithExitCode(ctx, "npm", "install", "-g", "yarn")
+		output.WriteString(yarnOut)
+		if yarnErr != nil {
+			output.WriteString(fmt.Sprintf("Warning: failed to install Yarn: %v\n", yarnErr))
+		} else {
+			yarnVersion, _, _ := e.RunCommandWithExitCode(ctx, "yarn", "-v")
+			output.WriteString(fmt.Sprintf("Yarn %s installed\n", strings.TrimSpace(yarnVersion)))
+		}
+	} else {
+		yarnVersion, _, _ := e.RunCommandWithExitCode(ctx, "yarn", "-v")
+		output.WriteString(fmt.Sprintf("Yarn already installed: %s\n", strings.TrimSpace(yarnVersion)))
+	}
+
+	// Install pnpm globally
+	pnpmCheck, _, _ := e.RunCommandWithExitCode(ctx, "which", "pnpm")
+	if strings.TrimSpace(pnpmCheck) == "" {
+		pnpmOut, _, pnpmErr := e.RunCommandWithExitCode(ctx, "npm", "install", "-g", "pnpm")
+		output.WriteString(pnpmOut)
+		if pnpmErr != nil {
+			output.WriteString(fmt.Sprintf("Warning: failed to install pnpm: %v\n", pnpmErr))
+		} else {
+			pnpmVersion, _, _ := e.RunCommandWithExitCode(ctx, "pnpm", "-v")
+			output.WriteString(fmt.Sprintf("pnpm %s installed\n", strings.TrimSpace(pnpmVersion)))
+		}
+	} else {
+		pnpmVersion, _, _ := e.RunCommandWithExitCode(ctx, "pnpm", "-v")
+		output.WriteString(fmt.Sprintf("pnpm already installed: %s\n", strings.TrimSpace(pnpmVersion)))
+	}
+
 	nodeVersion, _, _ := e.RunCommandWithExitCode(ctx, "node", "-v")
 	output.WriteString(fmt.Sprintf("Node.js %s installed successfully\n", strings.TrimSpace(nodeVersion)))
 	return comm.JobResult{Success: true, Output: output.String()}
