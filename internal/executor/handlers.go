@@ -1392,6 +1392,9 @@ func (e *Executor) handleDeploy(ctx context.Context, payload json.RawMessage) co
 		AppType        string `json:"app_type"`        // php, nodejs, static
 		NodeVersion    string `json:"node_version"`
 		PackageManager string `json:"package_manager"` // npm, yarn, pnpm
+		// Deploy hooks
+		PreDeployScript  string `json:"pre_deploy_script"`
+		PostDeployScript string `json:"post_deploy_script"`
 	}
 	if err := json.Unmarshal(payload, &p); err != nil {
 		return comm.JobResult{Success: false, Error: err.Error()}
@@ -1491,20 +1494,16 @@ func (e *Executor) handleDeploy(ctx context.Context, payload json.RawMessage) co
 		}
 	}
 
-	// Run build script if provided
-	if p.BuildScript != "" {
-		output.WriteString("Running build script...\n")
-		scriptPath := filepath.Join(releaseDir, ".sitekit-deploy.sh")
-		scriptContent := "#!/bin/bash\nset -e\ncd " + releaseDir + "\n"
-
+	// Helper function to build environment setup script
+	buildEnvSetup := func() string {
+		envSetup := ""
 		// Add PHP to PATH if PHP app
 		if p.PHPVersion != "" && (p.AppType == "" || p.AppType == "php") {
-			scriptContent += fmt.Sprintf("export PATH=/usr/bin/php%s:$PATH\n", p.PHPVersion)
+			envSetup += fmt.Sprintf("export PATH=/usr/bin/php%s:$PATH\n", p.PHPVersion)
 		}
-
 		// Add Node.js environment if Node.js app
 		if p.AppType == "nodejs" && p.NodeVersion != "" {
-			scriptContent += `
+			envSetup += `
 # Load nvm if available
 export NVM_DIR="/usr/local/nvm"
 if [ -s "$NVM_DIR/nvm.sh" ]; then
@@ -1518,7 +1517,36 @@ export HOME=/home/` + p.Username + `
 
 `
 		}
+		return envSetup
+	}
 
+	// Run pre-deploy script if provided
+	if p.PreDeployScript != "" {
+		output.WriteString("Running pre-deploy script...\n")
+		scriptPath := filepath.Join(releaseDir, ".sitekit-pre-deploy.sh")
+		scriptContent := "#!/bin/bash\nset -e\ncd " + releaseDir + "\n"
+		scriptContent += buildEnvSetup()
+		scriptContent += p.PreDeployScript
+
+		if err := os.WriteFile(scriptPath, []byte(scriptContent), 0755); err != nil {
+			return comm.JobResult{Success: false, Output: output.String(), Error: "Failed to write pre-deploy script: " + err.Error()}
+		}
+
+		out, _, err = e.RunCommandWithExitCode(ctx, "bash", scriptPath)
+		output.WriteString(out + "\n")
+		os.Remove(scriptPath)
+		if err != nil {
+			return comm.JobResult{Success: false, Output: output.String(), Error: "Pre-deploy script failed: " + err.Error()}
+		}
+		output.WriteString("Pre-deploy script completed\n")
+	}
+
+	// Run build script if provided
+	if p.BuildScript != "" {
+		output.WriteString("Running build script...\n")
+		scriptPath := filepath.Join(releaseDir, ".sitekit-deploy.sh")
+		scriptContent := "#!/bin/bash\nset -e\ncd " + releaseDir + "\n"
+		scriptContent += buildEnvSetup()
 		scriptContent += p.BuildScript
 
 		if err := os.WriteFile(scriptPath, []byte(scriptContent), 0755); err != nil {
@@ -1557,6 +1585,31 @@ export HOME=/home/` + p.Username + `
 	if err := os.Rename(tempLink, currentLink); err != nil {
 		os.Remove(tempLink)
 		return comm.JobResult{Success: false, Output: output.String(), Error: "Failed to activate release: " + err.Error()}
+	}
+
+	output.WriteString("Release activated\n")
+
+	// Run post-deploy script if provided
+	if p.PostDeployScript != "" {
+		output.WriteString("Running post-deploy script...\n")
+		scriptPath := filepath.Join(releaseDir, ".sitekit-post-deploy.sh")
+		scriptContent := "#!/bin/bash\nset -e\ncd " + releaseDir + "\n"
+		scriptContent += buildEnvSetup()
+		scriptContent += p.PostDeployScript
+
+		if err := os.WriteFile(scriptPath, []byte(scriptContent), 0755); err != nil {
+			output.WriteString(fmt.Sprintf("Warning: Failed to write post-deploy script: %v\n", err))
+		} else {
+			out, _, err := e.RunCommandWithExitCode(ctx, "bash", scriptPath)
+			output.WriteString(out + "\n")
+			os.Remove(scriptPath)
+			if err != nil {
+				// Post-deploy failure is a warning, not a hard failure
+				output.WriteString(fmt.Sprintf("Warning: Post-deploy script failed: %v\n", err))
+			} else {
+				output.WriteString("Post-deploy script completed\n")
+			}
+		}
 	}
 
 	output.WriteString(fmt.Sprintf("Deployment successful! Release: %s\n", p.CommitHash[:12]))
