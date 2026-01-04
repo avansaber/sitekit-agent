@@ -1389,9 +1389,10 @@ func (e *Executor) handleDeploy(ctx context.Context, payload json.RawMessage) co
 		BuildScript       string   `json:"build_script"`
 		PHPVersion        string   `json:"php_version"`
 		// Node.js specific fields
-		AppType        string `json:"app_type"`        // php, nodejs, static
-		NodeVersion    string `json:"node_version"`
-		PackageManager string `json:"package_manager"` // npm, yarn, pnpm
+		AppType          string `json:"app_type"`           // php, nodejs, static
+		NodeVersion      string `json:"node_version"`
+		PackageManager   string `json:"package_manager"`    // npm, yarn, pnpm
+		CacheNodeModules bool   `json:"cache_node_modules"` // Share node_modules across deploys
 		// Deploy hooks
 		PreDeployScript  string `json:"pre_deploy_script"`
 		PostDeployScript string `json:"post_deploy_script"`
@@ -1491,6 +1492,36 @@ func (e *Executor) handleDeploy(ctx context.Context, payload json.RawMessage) co
 			log.Warn().Err(err).Str("file", file).Msg("Failed to symlink shared file")
 		} else {
 			output.WriteString(fmt.Sprintf("Linked shared file: %s\n", file))
+		}
+	}
+
+	// Setup node_modules caching for Node.js apps
+	if p.CacheNodeModules && p.AppType == "nodejs" {
+		nodeModulesShared := filepath.Join(sharedDir, "node_modules")
+		nodeModulesRelease := filepath.Join(releaseDir, "node_modules")
+
+		// Create shared node_modules directory if it doesn't exist
+		if _, err := os.Stat(nodeModulesShared); os.IsNotExist(err) {
+			os.MkdirAll(nodeModulesShared, 0755)
+			output.WriteString("Created shared node_modules directory\n")
+		}
+
+		// Remove node_modules from release if it exists (from clone)
+		os.RemoveAll(nodeModulesRelease)
+
+		// Create symlink to shared node_modules
+		if err := os.Symlink(nodeModulesShared, nodeModulesRelease); err != nil {
+			log.Warn().Err(err).Msg("Failed to symlink node_modules")
+			output.WriteString(fmt.Sprintf("Warning: Failed to symlink node_modules: %v\n", err))
+		} else {
+			output.WriteString("Linked shared node_modules for faster deployments\n")
+		}
+
+		// Set ownership for shared node_modules
+		if p.Username != "" {
+			if out, err := e.RunCommand(ctx, "chown", "-R", p.Username+":"+p.Username, nodeModulesShared); err != nil {
+				log.Warn().Err(err).Str("output", out).Msg("Failed to set node_modules ownership")
+			}
 		}
 	}
 
